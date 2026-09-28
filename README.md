@@ -22,10 +22,11 @@ No Python.
 | step | tools | output |
 |---|---|---|
 | 1. read lengths | `seqkit fx2tab -n -l` | `porec.genome` (FASTQ order) |
-| 2. Pore-C → HiFi alignment | `minimap2 -c -N` + `gawk` | `hifi_blocks.bed.gz`: continuous blocks of each HiFi read, in Pore-C coordinates |
-| 3. restriction sites | `seqkit locate` + `awk` | exact cut position `x = motif start + CUT_OFFSET` |
-| 4. HiFi protection | `bedtools map -f 1.0 -o count_distinct` | `sites.final.tsv.gz` (`span`, class P/C) |
-| 5. cutting, pseudo-monomer filter, all-to-all pairs | `seqkit fx2tab` + `awk` | R1/R2, monomers |
+| 2. overlapping windows for long reads | `seqkit fx2tab` + `awk` | `porec_windows.fa.gz` |
+| 3. Pore-C → HiFi alignment | `minimap2 -c -N` + `gawk` | `hifi_blocks.bed.gz`: continuous blocks of each HiFi read, in Pore-C coordinates |
+| 4. restriction sites | `seqkit locate` + `awk` | exact cut position `x = motif start + CUT_OFFSET` |
+| 5. HiFi protection | `bedtools map -f 1.0 -o count_distinct` | `sites.final.tsv.gz` (`span`, class P/C) |
+| 6. cutting, pseudo-monomer filter, all-to-all pairs | `seqkit fx2tab` + `awk` | R1/R2, monomers |
 
 - **No global sort:** all files stay in Pore-C FASTQ order, and
   `bedtools map -g porec.genome` works in that order.
@@ -37,10 +38,11 @@ No Python.
   | step | output checked |
   |---|---|
   | 1 | `porec.genome` |
-  | 2 | `hifi_blocks.bed.gz` |
-  | 3 | `sites.tsv` (or `sites.final.tsv.gz`) |
-  | 4 | `sites.final.tsv.gz` |
-  | 5 | `porec_hic_R1.fastq.gz`, `porec_hic_R2.fastq.gz`, `porec_hic.stats` (and `porec_hic_monomers.fastq.gz`) |
+  | 2 | `porec_windows.fa.gz` |
+  | 3 | `hifi_blocks.bed.gz` |
+  | 4 | `sites.tsv` (or `sites.final.tsv.gz`) |
+  | 5 | `sites.final.tsv.gz` |
+  | 6 | `porec_hic_R1.fastq.gz`, `porec_hic_R2.fastq.gz`, `porec_hic.stats` (and `porec_hic_monomers.fastq.gz`) |
 
 - **Log:** every message is timestamped. The log gives the duration of each step and
   the total time at the end. The total covers the current run only: skipped steps
@@ -56,8 +58,9 @@ Pore-C read coordinates:
 
 1. the alignment is split at every indel ≥ `MAX_GAP`, read from the CIGAR (`-c`);
 2. blocks of the **same HiFi read**, on the same strand, are merged when they are
-   colinear and separated by less than `MAX_GAP` on the Pore-C read **and** on the HiFi
-   read.
+   colinear: the hole between them is less than `MAX_GAP` on the Pore-C read **and** on
+   the HiFi read, and their diagonals differ by less than `MAX_GAP`. This also joins the
+   overlapping blocks of two consecutive windows (see below).
 
 What this means for a HiFi read aligned on the bases flanking a site:
 
@@ -68,6 +71,48 @@ What this means for a HiFi read aligned on the bases flanking a site:
 | two blocks of the same HiFi read with a jump ≥ `MAX_GAP`, or on different strands (short-range cis ligation, inversion) | not continuous | no |
 | blocks from different HiFi reads, one ending before `x` and the other starting after it | typical junction | no |
 | a block that passes `x` by less than `FLANK` bp | alignment overshoot, not evidence of continuity | no |
+
+## Short and long Pore-C reads: alignment by windows
+
+minimap2 caps the number of secondary hits (`-N`) **per query**. With whole reads as
+queries, all the monomers of a read share one cap:
+
+- **Short reads:** a few monomers, so the cap is enough.
+- **Long reads:** tens or hundreds of monomers. The longest monomers use up the cap, and
+  the others keep only their primary alignment, so fewer than `MIN_COV` HiFi reads cross
+  their sites, which are then cut by mistake.
+
+Pore-C reads longer than `WINDOW` (2 kb) are therefore aligned as **overlapping
+windows** of 2 kb, overlapping by `WINDOW_OVERLAP` (250 bp). The last window is aligned
+on the read end. Reads of 2 kb or less stay whole.
+
+- **Per-window cap.** Each window gets its own `-N` cap, so HiFi coverage per monomer no
+  longer depends on read length.
+- **Back to read coordinates.** Blocks are converted back to read coordinates, and the
+  blocks of a HiFi read in two overlapping windows are merged.
+- **Every site is evaluated.** Every site lies at least 125 bp from the edge of one
+  window, so it is always evaluated away from window boundaries.
+- **Cost.** Only the overlaps are aligned twice, about 14% extra bases for reads longer
+  than 2 kb.
+
+Simulation: 3,000 short reads (1–6 monomers) and 300 long reads (20–40 monomers,
+about 25 kb), HiFi 20x.
+
+| alignment | `MM2_N` | short reads: precision | long reads: precision | long reads: false cuts |
+|---|---|---|---|---|
+| whole reads | 100 | 0.903 | **0.472** | 9,333 |
+| whole reads | 200 | 0.909 | 0.553 | 6,748 |
+| windows 1 kb / 250 bp | 100 | 0.921 | 0.931 | 622 |
+| **windows 2 kb / 250 bp (default)** | 200 | 0.916 | **0.925** | 679 |
+| windows 4 kb / 500 bp | 100 | 0.907 | 0.854 | 1,439 |
+| windows 2 kb / 500 bp | 30 | 0.729 | 0.744 | 2,898 |
+
+- **Recall.** Recall on intact motifs is 99.4–99.6% in every configuration.
+- **Window size.** 1–2 kb windows give the same result for short and long reads. 4 kb
+  windows start to lose precision again.
+- **`MM2_N`.** It must stay well above the HiFi depth: 30 is too low at 20x.
+- **Recommendation for `MM2_N`.** Aim for at least 5 × the HiFi depth. With 36.9 Gb of
+  HiFi, the default of 200 covers genomes of 1 Gb (37x) and larger.
 
 ### `MAX_GAP`
 
@@ -162,17 +207,18 @@ bp appears between the two cuts. Monomer lengths on the simulation:
 | `DUP_MOTIF` | 1 | keep the motif on both monomers |
 | `WRITE_MONOMERS` | 1 | write `porec_hic_monomers.fastq.gz` (used by the QC below) |
 | `MM2_PRESET` | `map-ont` | `lr:hq` for ONT R10 Q20+ reads |
-| `MM2_N` | 100 | minimap2 secondary hits. The cap applies **per Pore-C read**; aim for about `MIN_COV` × number of monomers × 5 |
+| `MM2_N` | 200 | minimap2 secondary hits, capped **per window**; aim for ≥ 5 × HiFi depth |
+| `WINDOW` / `WINDOW_OVERLAP` | 2000 / 250 | reads longer than `WINDOW` are aligned as overlapping windows (`WINDOW=0`: whole reads) |
 | `MM2_BATCH` | 50G | HiFi index batch size (`-I` with `--split-prefix`) |
 | `MM2_EXTRA` | – | extra minimap2 options |
 
 ## Cost
 
-- **Volume.** Step 2 produces about (number of Pore-C monomers) × (HiFi depth)
+- **Volume.** Step 3 produces about (number of Pore-C monomers) × (HiFi depth)
   alignments, with CIGAR.
-- **Subsampling HiFi.** With `MIN_COV=3`, 10–15x of HiFi is enough. Subsampling the HiFi
-  reads (`seqkit sample`) reduces minimap2 time and the size of `hifi_blocks.bed.gz`
-  accordingly.
+- **HiFi depth.** Time and the size of `hifi_blocks.bed.gz` scale with HiFi depth (up to
+  `MM2_N` hits per window).
+- **Windows.** They add about 14% of aligned bases for reads longer than 2 kb.
 
 ## Recommended post-analysis checks and filters
 

@@ -35,7 +35,9 @@ WRITE_MONOMERS=${WRITE_MONOMERS:-1}     # 1 = also write the FASTQ of kept monom
 
 THREADS=${THREADS:-96}
 MM2_PRESET=${MM2_PRESET:-map-ont} # lr:hq for ONT R10 Q20+ reads (minimap2 >= 2.27)
-MM2_N=${MM2_N:-100}               # secondary hits = other HiFi reads of the locus (cap is PER Pore-C READ)
+MM2_N=${MM2_N:-200}               # secondary hits = other HiFi reads of the locus (cap is PER WINDOW)
+WINDOW=${WINDOW:-2000}            # Pore-C reads longer than this are aligned as overlapping windows (0 = off)
+WINDOW_OVERLAP=${WINDOW_OVERLAP:-250}   # overlap (bp) between consecutive windows (> 2 x FLANK)
 MM2_BATCH=${MM2_BATCH:-50G}       # HiFi index batch size (-I) with --split-prefix
 MM2_EXTRA=${MM2_EXTRA:-}
 
@@ -49,6 +51,9 @@ if [[ "${RC^^}" != "${MOTIF^^}" ]]; then
   echo "ERROR: motif $MOTIF is not palindromic (revcomp $RC): not supported" >&2; exit 1
 fi
 MOTIF_LEN=${#MOTIF}
+if (( WINDOW > 0 && ( WINDOW_OVERLAP * 2 > WINDOW || WINDOW_OVERLAP <= 2 * FLANK ) )); then
+  echo "ERROR: WINDOW_OVERLAP must be > 2 x FLANK and <= WINDOW / 2" >&2; exit 1
+fi
 
 # ------------------------------------------------------------------------------
 # LOGGING, TIMING AND RESUME HELPERS
@@ -87,15 +92,16 @@ echo "Min monomer   : ${MIN_MONO_LEN}bp (shorter monomers removed before pairing
 echo "Threads       : $THREADS"
 echo "Output dir    : $PWD"
 echo "Index batch   : $MM2_BATCH"
+echo "Windows       : ${WINDOW}bp, overlap ${WINDOW_OVERLAP}bp, -N $MM2_N per window"
 echo "======================================================================"
 
 # ------------------------------------------------------------------------------
 # STEP 1: PORE-C READ LENGTHS (FASTQ order = sort order used by bedtools)
 # ------------------------------------------------------------------------------
 if done_already porec.genome; then
-  step_skip "STEP 1/5" "Pore-C read lengths" porec.genome
+  step_skip "STEP 1/6" "Pore-C read lengths" porec.genome
 else
-  step_begin "STEP 1/5" "Extracting Pore-C read lengths..."
+  step_begin "STEP 1/6" "Extracting Pore-C read lengths..."
   (   # run in the background so that a stop signal is handled immediately
   trap - ERR INT TERM
   seqkit fx2tab -n -i -l -j "$THREADS" "$POREC_FQ" | cut -f1,2 > porec.genome.tmp
@@ -108,26 +114,62 @@ log "  -> Pore-C reads input        : $N_POREC"
 log "  -> Total bases / mean length : $TOT_BP bp / $(awk -v t="$TOT_BP" -v n="$N_POREC" 'BEGIN {printf "%.1f", n ? t / n : 0}') bp"
 
 # ------------------------------------------------------------------------------
-# STEP 2: PORE-C READS (query) ALIGNED ON HIFI READS (target) -> CONTINUOUS BLOCKS
+# STEP 2: PORE-C READS SPLIT INTO OVERLAPPING WINDOWS
+# ------------------------------------------------------------------------------
+# minimap2 caps secondary hits (-N) per QUERY. With whole reads as queries, a
+# long Pore-C read (many monomers) shares one cap between all its monomers, and
+# most of them would get too few HiFi reads -> false cuts. Reads longer than
+# WINDOW are therefore split into windows of WINDOW bp overlapping by
+# WINDOW_OVERLAP bp (the last window is aligned on the read end); shorter reads
+# stay whole. Each window gets its own cap, so coverage no longer depends on
+# read length. Window name = <read>_W<offset>; step 3 adds the offset back and
+# merges the blocks of a HiFi read across overlapping windows.
+WINDOWS=porec_windows.fa.gz
+if done_already "$WINDOWS"; then
+  step_skip "STEP 2/6" "Pore-C windows" "$WINDOWS"
+else
+  step_begin "STEP 2/6" "Splitting Pore-C reads into ${WINDOW}bp windows (overlap ${WINDOW_OVERLAP}bp)..."
+  (   # run in the background so that a stop signal is handled immediately
+  trap - ERR INT TERM
+  seqkit fx2tab -i -j "$THREADS" "$POREC_FQ" | \
+  awk -v W="$WINDOW" -v O="$WINDOW_OVERLAP" 'BEGIN { FS = "\t" }
+    {
+      L = length($2)
+      if (W <= 0 || L <= W) { print ">" $1 "_W0\n" $2; next }
+      for (s = 0; s + W < L; s += W - O) print ">" $1 "_W" s "\n" substr($2, s + 1, W)
+      print ">" $1 "_W" (L - W) "\n" substr($2, L - W + 1, W)
+    }' | $GZ > "$WINDOWS.tmp"
+  mv "$WINDOWS.tmp" "$WINDOWS"
+  ) & wait $!
+  step_end
+fi
+N_WIN=$($GZ -dc "$WINDOWS" | grep -c '^>' || true)
+log "  -> Alignment queries (windows) : $N_WIN"
+
+# ------------------------------------------------------------------------------
+# STEP 3: PORE-C READS (query) ALIGNED ON HIFI READS (target) -> CONTINUOUS BLOCKS
 # ------------------------------------------------------------------------------
 # Each Pore-C monomer aligns on the HiFi reads of its locus; -N keeps the other
 # HiFi reads of the locus (secondary hits). -c gives the CIGAR: an alignment is
-# split into blocks at every indel >= MAX_GAP. Then, for a given HiFi read (same
-# strand), colinear blocks separated by < MAX_GAP (on the Pore-C AND on the HiFi
-# read) are merged: a HiFi read aligned on both flanks of a site, with a small
-# hole caused by sequencing errors, stays continuous across that site.
+# split into blocks at every indel >= MAX_GAP. Window coordinates are converted
+# back to read coordinates. Then, for a given HiFi read (same strand), colinear
+# blocks are merged when the hole between them is < MAX_GAP on the Pore-C AND on
+# the HiFi read, and their diagonals differ by < MAX_GAP (this also joins the
+# overlapping blocks of two consecutive windows): a HiFi read aligned on both
+# flanks of a site, with a small hole caused by sequencing errors, stays
+# continuous across that site.
 # Output (FASTQ order, sorted by start within each read):
 #   porec_read  start  end  hifi_read
 BLOCKS=hifi_blocks.bed.gz
 if done_already "$BLOCKS"; then
-  step_skip "STEP 2/5" "Pore-C -> HiFi alignment" "$BLOCKS"
+  step_skip "STEP 3/6" "Pore-C -> HiFi alignment" "$BLOCKS"
 else
-  step_begin "STEP 2/5" "Aligning Pore-C reads on HiFi reads (minimap2 -c, $MM2_PRESET)..."
+  step_begin "STEP 3/6" "Aligning Pore-C reads on HiFi reads (minimap2 -c, $MM2_PRESET)..."
   (   # run in the background so that a stop signal is handled immediately
   trap - ERR INT TERM
   rm -rf mm2_tmp; mkdir -p mm2_tmp
   minimap2 -c -x "$MM2_PRESET" -t "$THREADS" -I "$MM2_BATCH" --split-prefix mm2_tmp/split \
-      --secondary=yes -N "$MM2_N" $MM2_EXTRA "$HIFI_FQ" "$POREC_FQ" 2> minimap2.log | \
+      --secondary=yes -N "$MM2_N" $MM2_EXTRA "$HIFI_FQ" "$WINDOWS" 2> minimap2.log | \
   gawk -v G="$MAX_GAP" -v LONG="[0-9]{${#MAX_GAP},}[IDN]" '
     BEGIN { OFS = "\t" }
     function add(q1, q2, t1, t2) {
@@ -145,9 +187,10 @@ else
         if (p && HT[i] == HT[p] && HS[i] == HS[p]) {
           gq = Q1[i] - Q2[p]
           gt = (HS[i] == "+") ? T1[i] - T2[p] : T1[p] - T2[i]
-          if (gq > -G && gq < G && gt > -G && gt < G) {
+          if (gq < G && gt < G && gq - gt < G && gt - gq < G) {
             if (Q2[i] > Q2[p]) Q2[p] = Q2[i]
-            if (HS[i] == "+") T2[p] = T2[i]; else T1[p] = T1[i]
+            if (HS[i] == "+") { if (T2[i] > T2[p]) T2[p] = T2[i] }
+            else              { if (T1[i] < T1[p]) T1[p] = T1[i] }
             continue
           }
         }
@@ -162,14 +205,16 @@ else
       for (i in O) print cur, MQ1[i], MQ2[i], MT[i]
       n = 0
     }
-    $1 != cur { flush(); cur = $1 }
     {
-      st = $5; hifi = $6
+      match($1, /_W[0-9]+$/)                           # window name -> read name + offset
+      rd = substr($1, 1, RSTART - 1); off = substr($1, RSTART + 2) + 0
+      if (rd != cur) { flush(); cur = rd }
+      st = $5; hifi = $6; qs = $3 + off; qe = $4 + off
       cg = ""
       for (i = 13; i <= NF; i++) if (substr($i, 1, 5) == "cg:Z:") { cg = substr($i, 6); break }
-      if (cg !~ LONG) { add($3 + 0, $4 + 0, $8 + 0, $9 + 0); next }   # no indel >= MAX_GAP
+      if (cg !~ LONG) { add(qs, qe, $8 + 0, $9 + 0); next }   # no indel >= MAX_GAP
       k = split(cg, L, /[MIDNSHP=X]/, OP)
-      qp = (st == "+") ? $3 : $4; tp = $8 + 0; bq = qp; bt = tp
+      qp = (st == "+") ? qs : qe; tp = $8 + 0; bq = qp; bt = tp
       for (i = 1; i < k; i++) {
         len = L[i] + 0; op = OP[i]
         big = (op == "I" || op == "D" || op == "N") && len >= G
@@ -190,13 +235,13 @@ N_ALN_READS=$($GZ -dc "$BLOCKS" | cut -f1 | uniq | wc -l)
 log "  -> Pore-C reads with HiFi alignments : $N_ALN_READS"
 
 # ------------------------------------------------------------------------------
-# STEP 3: RESTRICTION SITES (exact cut position)
+# STEP 4: RESTRICTION SITES (exact cut position)
 # ------------------------------------------------------------------------------
 # sites.tsv: read  length  motif_start  motif_end  x   (x = cut = motif_start + CUT_OFFSET)
 if done_already sites.tsv || done_already sites.final.tsv.gz; then
-  step_skip "STEP 3/5" "Restriction motifs" "$([[ -e sites.tsv ]] && echo sites.tsv || echo sites.final.tsv.gz)"
+  step_skip "STEP 4/6" "Restriction motifs" "$([[ -e sites.tsv ]] && echo sites.tsv || echo sites.final.tsv.gz)"
 else
-  step_begin "STEP 3/5" "Locating restriction motifs ($MOTIF)..."
+  step_begin "STEP 4/6" "Locating restriction motifs ($MOTIF)..."
   (   # run in the background so that a stop signal is handled immediately
   trap - ERR INT TERM
   seqkit locate -P -d -i -j "$THREADS" -p "$MOTIF" --bed "$POREC_FQ" | \
@@ -217,7 +262,7 @@ N_MOTIFS=$(if [[ -e sites.final.tsv.gz ]]; then $GZ -dc sites.final.tsv.gz | wc 
 log "  -> Candidate motif sites     : $N_MOTIFS"
 
 # ------------------------------------------------------------------------------
-# STEP 4: SITE PROTECTION BY HIFI READS (bedtools map)
+# STEP 5: SITE PROTECTION BY HIFI READS (bedtools map)
 # ------------------------------------------------------------------------------
 #  span = number of DISTINCT HiFi reads with a continuous block covering
 #         [x-FLANK, x+FLANK] ENTIRELY (window truncated at read ends)
@@ -225,9 +270,9 @@ log "  -> Candidate motif sites     : $N_MOTIFS"
 #  C (cut)      : span <  MIN_COV -> cut, including when no HiFi read is present
 # sites.final.tsv.gz: read  length  motif_start  motif_end  x  span  class
 if done_already sites.final.tsv.gz; then
-  step_skip "STEP 4/5" "HiFi protection" sites.final.tsv.gz
+  step_skip "STEP 5/6" "HiFi protection" sites.final.tsv.gz
 else
-  step_begin "STEP 4/5" "Computing HiFi protection at each site (bedtools map)..."
+  step_begin "STEP 5/6" "Computing HiFi protection at each site (bedtools map)..."
   (   # run in the background so that a stop signal is handled immediately
   trap - ERR INT TERM
   paste sites.tsv \
@@ -249,19 +294,19 @@ log "  -> Protected sites (>= $MIN_COV HiFi) : $N_PROT ($(pct "$N_PROT" "$N_MOTI
 log "  -> Cut sites (< $MIN_COV HiFi)        : $N_CUT ($(pct "$N_CUT" "$N_MOTIFS")%)"
 
 # ------------------------------------------------------------------------------
-# STEP 5: CUTTING + PSEUDO-MONOMER FILTER + ALL-TO-ALL PAIRS
+# STEP 6: CUTTING + PSEUDO-MONOMER FILTER + ALL-TO-ALL PAIRS
 # ------------------------------------------------------------------------------
 # Every unprotected site is cut. A motif lying within ~FLANK bp of a real
 # junction is not protected either: a pseudo-monomer of a few bp appears between
 # the two cuts. Monomers < MIN_MONO_LEN are dropped BEFORE pairing (they are not
 # mappable anyway). A read with n kept monomers gives n(n-1)/2 pairs
 # @read:i-j/1 and /2.
-OUT5=("${PREFIX}_R1.fastq.gz" "${PREFIX}_R2.fastq.gz" "${PREFIX}.stats")
-[[ "$WRITE_MONOMERS" == 1 ]] && OUT5+=("${PREFIX}_monomers.fastq.gz")
-if done_already "${OUT5[@]}"; then
-  step_skip "STEP 5/5" "Cutting & all-to-all pairs" "${OUT5[*]}"
+OUT6=("${PREFIX}_R1.fastq.gz" "${PREFIX}_R2.fastq.gz" "${PREFIX}.stats")
+[[ "$WRITE_MONOMERS" == 1 ]] && OUT6+=("${PREFIX}_monomers.fastq.gz")
+if done_already "${OUT6[@]}"; then
+  step_skip "STEP 6/6" "Cutting & all-to-all pairs" "${OUT6[*]}"
 else
-  step_begin "STEP 5/5" "Cutting reads & writing all-to-all pseudo-Hi-C pairs..."
+  step_begin "STEP 6/6" "Cutting reads & writing all-to-all pseudo-Hi-C pairs..."
   (   # run in the background so that a stop signal is handled immediately
   trap - ERR INT TERM
   seqkit fx2tab -i -j "$THREADS" "$POREC_FQ" | \
@@ -308,7 +353,7 @@ else
     }'
   read -r _ _ _ _ _ _ _ NCUTS_DONE < stats.tmp
   [[ $NCUTS_DONE -eq $N_CUT ]] || { log "ERROR: $NCUTS_DONE cuts applied, $N_CUT expected" >&2; exit 1; }
-  for f in "${OUT5[@]}"; do [[ "$f" == "${PREFIX}.stats" ]] || mv "$f.tmp" "$f"; done
+  for f in "${OUT6[@]}"; do [[ "$f" == "${PREFIX}.stats" ]] || mv "$f.tmp" "$f"; done
   mv stats.tmp "${PREFIX}.stats"                      # written last: marks the step as complete
   ) & wait $!
   step_end
