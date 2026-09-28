@@ -3,48 +3,48 @@
 #  HIFI-GUIDED PORE-C DIGESTION -> ALL-TO-ALL PSEUDO-HI-C PAIRS
 # ==============================================================================
 #  Usage : POREC_FQ=porec.fq.gz HIFI_FQ=hifi.fq.gz ./porec2hic_hifi.sh
-#  Outils : minimap2, seqkit, bedtools, gawk, (pigz). Aucun script python.
-#  Toutes les variables ci-dessous peuvent être surchargées par l'environnement.
-#  Chaque étape laisse un fichier stepN.done : une relance reprend là où elle s'est arrêtée.
+#  Tools: minimap2, seqkit, bedtools, gawk, (pigz). No Python.
+#  Every variable below can be overridden from the environment.
+#  Each step writes a stepN.done file: a re-run resumes where it stopped.
 #
-#  Tous les fichiers intermédiaires restent dans l'ordre du FASTQ Pore-C
-#  (bedtools map -g porec.genome) : aucun tri global n'est nécessaire.
+#  All intermediate files stay in Pore-C FASTQ order (bedtools map -g
+#  porec.genome): no global sort is needed.
 # ==============================================================================
 set -euo pipefail
 export LC_ALL=C
 
 # ------------------------------------------------------------------------------
-# VARIABLES DU PIPELINE
+# PIPELINE PARAMETERS
 # ------------------------------------------------------------------------------
-POREC_FQ=${POREC_FQ:?"POREC_FQ non défini"}
-HIFI_FQ=${HIFI_FQ:?"HIFI_FQ non défini (FASTQ/FASTA HiFi ou index .mmi)"}
+POREC_FQ=${POREC_FQ:?"POREC_FQ is not set"}
+HIFI_FQ=${HIFI_FQ:?"HIFI_FQ is not set (HiFi FASTQ/FASTA or .mmi index)"}
 OUTDIR=${OUTDIR:-porec2hic_out}
 PREFIX=${PREFIX:-porec_hic}
 
-MOTIF=${MOTIF:-CATG}              # motif palindromique, IUPAC accepté (GATC, GANTC, ...)
-CUT_OFFSET=${CUT_OFFSET:-4}       # coupure dans le motif : NlaIII CATG^ = 4, DpnII ^GATC = 0
-DUP_MOTIF=${DUP_MOTIF:-1}         # 1 = le motif reconstitué à la ligation est gardé sur les 2 monomères
+MOTIF=${MOTIF:-CATG}              # palindromic motif, IUPAC codes allowed (GATC, GANTC, ...)
+CUT_OFFSET=${CUT_OFFSET:-4}       # cut position inside the motif: NlaIII CATG^ = 4, DpnII ^GATC = 0
+DUP_MOTIF=${DUP_MOTIF:-1}         # 1 = keep the motif (rebuilt by ligation) on both monomers
 
-MIN_COV=${MIN_COV:-3}             # site PROTÉGÉ si >= MIN_COV reads HiFi continus sur [x-FLANK, x+FLANK] ; sinon coupé
-FLANK=${FLANK:-15}                # marge (pb) exigée de part et d'autre du site (> longueur motif + débordement)
-MAX_GAP=${MAX_GAP:-50}            # indel/trou (pb) au-delà duquel un alignement HiFi n'est plus continu
-MIN_MONO_LEN=${MIN_MONO_LEN:-$(( FLANK + ${#MOTIF} + 1 ))}  # < FLANK+motif : pseudo-monomères écartés avant l'appariement
-WRITE_MONOMERS=${WRITE_MONOMERS:-0}     # 1 = écrire aussi le FASTQ des monomères
+MIN_COV=${MIN_COV:-3}             # site PROTECTED if >= MIN_COV HiFi reads are continuous over [x-FLANK, x+FLANK]; otherwise cut
+FLANK=${FLANK:-15}                # margin (bp) required on each side of the site (> motif length + alignment overshoot)
+MAX_GAP=${MAX_GAP:-50}            # indel/hole (bp) from which a HiFi alignment is no longer continuous
+MIN_MONO_LEN=${MIN_MONO_LEN:-$(( FLANK + ${#MOTIF} + 1 ))}  # monomers shorter than this (pseudo-monomers) are dropped before pairing
+WRITE_MONOMERS=${WRITE_MONOMERS:-1}     # 1 = also write the FASTQ of kept monomers (used by the QC in README)
 
 THREADS=${THREADS:-96}
-MM2_PRESET=${MM2_PRESET:-map-ont} # lr:hq pour ONT R10 Q20+ (minimap2 >= 2.27)
-MM2_N=${MM2_N:-100}               # secondaires = autres reads HiFi du locus (plafond PAR READ Pore-C)
-MM2_BATCH=${MM2_BATCH:-50G}       # lots d'index HiFi (-I) + --split-prefix
+MM2_PRESET=${MM2_PRESET:-map-ont} # lr:hq for ONT R10 Q20+ reads (minimap2 >= 2.27)
+MM2_N=${MM2_N:-100}               # secondary hits = other HiFi reads of the locus (cap is PER Pore-C READ)
+MM2_BATCH=${MM2_BATCH:-50G}       # HiFi index batch size (-I) with --split-prefix
 MM2_EXTRA=${MM2_EXTRA:-}
 
 for tool in minimap2 seqkit bedtools gawk; do
-  command -v "$tool" >/dev/null || { echo "ERROR: $tool introuvable" >&2; exit 1; }
+  command -v "$tool" >/dev/null || { echo "ERROR: $tool not found" >&2; exit 1; }
 done
 if command -v pigz >/dev/null; then GZ="pigz -p 8"; else GZ="gzip -3"; fi
 
 RC=$(echo "$MOTIF" | tr 'ACGTRYKMBDHVNacgtrykmbdhvn' 'TGCAYRMKVHDBNtgcayrmkvhdbn' | rev)
 if [[ "${RC^^}" != "${MOTIF^^}" ]]; then
-  echo "ERROR: motif $MOTIF non palindromique (revcomp $RC) : non supporté" >&2; exit 1
+  echo "ERROR: motif $MOTIF is not palindromic (revcomp $RC): not supported" >&2; exit 1
 fi
 MOTIF_LEN=${#MOTIF}
 
@@ -65,7 +65,7 @@ echo "Output dir    : $PWD"
 echo "======================================================================"
 
 # ------------------------------------------------------------------------------
-# STEP 1: LONGUEURS DES READS PORE-C (ordre du FASTQ = ordre de tri pour bedtools)
+# STEP 1: PORE-C READ LENGTHS (FASTQ order = sort order used by bedtools)
 # ------------------------------------------------------------------------------
 if [[ ! -e step1.done ]]; then
   echo -e "\n[STEP 1/5] Extracting Pore-C read lengths..."
@@ -77,16 +77,16 @@ echo "  -> Pore-C reads input        : $N_POREC"
 echo "  -> Total bases / mean length : $TOT_BP bp / $(awk -v t="$TOT_BP" -v n="$N_POREC" 'BEGIN {printf "%.1f", n ? t / n : 0}') bp"
 
 # ------------------------------------------------------------------------------
-# STEP 2: ALIGNEMENT PORE-C (requête) SUR LES READS HIFI (cible) -> BLOCS CONTINUS
+# STEP 2: PORE-C READS (query) ALIGNED ON HIFI READS (target) -> CONTINUOUS BLOCKS
 # ------------------------------------------------------------------------------
-# Chaque monomère Pore-C s'aligne sur les reads HiFi de son locus ; -N garde les
-# autres reads HiFi du locus (secondaires). -c donne le CIGAR : un alignement est
-# coupé en blocs à chaque indel >= MAX_GAP. Puis, pour un même read HiFi (même
-# brin), les blocs colinéaires séparés de < MAX_GAP (sur le Pore-C ET sur le HiFi)
-# sont fusionnés : un read HiFi aligné sur les deux flancs d'un site, avec un
-# petit trou dû aux erreurs de séquençage, reste continu à travers ce site.
-# Sortie (ordre du FASTQ, triée par début dans chaque read) :
-#   read_porec  début  fin  read_hifi
+# Each Pore-C monomer aligns on the HiFi reads of its locus; -N keeps the other
+# HiFi reads of the locus (secondary hits). -c gives the CIGAR: an alignment is
+# split into blocks at every indel >= MAX_GAP. Then, for a given HiFi read (same
+# strand), colinear blocks separated by < MAX_GAP (on the Pore-C AND on the HiFi
+# read) are merged: a HiFi read aligned on both flanks of a site, with a small
+# hole caused by sequencing errors, stays continuous across that site.
+# Output (FASTQ order, sorted by start within each read):
+#   porec_read  start  end  hifi_read
 BLOCKS=hifi_blocks.bed.gz
 if [[ ! -e step2.done ]]; then
   echo -e "\n[STEP 2/5] Aligning Pore-C reads on HiFi reads (minimap2 -c, $MM2_PRESET)..."
@@ -101,7 +101,7 @@ if [[ ! -e step2.done ]]; then
     }
     function flush(   i, p, m, gq, gt) {
       if (!n) return
-      # fusion des blocs colinéaires d un même read HiFi
+      # merge colinear blocks of the same HiFi read
       delete K
       for (i = 1; i <= n; i++) K[i] = sprintf("%s\t%s\t%012d", HT[i], HS[i], Q1[i])
       PROCINFO["sorted_in"] = "@val_str_asc"
@@ -120,7 +120,7 @@ if [[ ! -e step2.done ]]; then
         p = i
       }
       m++; MQ1[m] = Q1[p]; MQ2[m] = Q2[p]; MT[m] = HT[p]
-      # sortie triée par début sur le read Pore-C (requis par bedtools map)
+      # output sorted by start on the Pore-C read (required by bedtools map)
       delete O
       for (i = 1; i <= m; i++) O[i] = MQ1[i]
       PROCINFO["sorted_in"] = "@val_num_asc"
@@ -132,7 +132,7 @@ if [[ ! -e step2.done ]]; then
       st = $5; hifi = $6
       cg = ""
       for (i = 13; i <= NF; i++) if (substr($i, 1, 5) == "cg:Z:") { cg = substr($i, 6); break }
-      if (cg !~ LONG) { add($3 + 0, $4 + 0, $8 + 0, $9 + 0); next }   # aucun indel >= MAX_GAP
+      if (cg !~ LONG) { add($3 + 0, $4 + 0, $8 + 0, $9 + 0); next }   # no indel >= MAX_GAP
       k = split(cg, L, /[MIDNSHP=X]/, OP)
       qp = (st == "+") ? $3 : $4; tp = $8 + 0; bq = qp; bt = tp
       for (i = 1; i < k; i++) {
@@ -153,9 +153,9 @@ N_ALN_READS=$($GZ -dc "$BLOCKS" | cut -f1 | uniq | wc -l)
 echo "  -> Pore-C reads with HiFi alignments : $N_ALN_READS"
 
 # ------------------------------------------------------------------------------
-# STEP 3: SITES DE RESTRICTION (position de coupure exacte)
+# STEP 3: RESTRICTION SITES (exact cut position)
 # ------------------------------------------------------------------------------
-# sites.tsv : read  longueur  début_motif  fin_motif  x   (x = coupure = début + CUT_OFFSET)
+# sites.tsv: read  length  motif_start  motif_end  x   (x = cut = motif_start + CUT_OFFSET)
 if [[ ! -e step3.done ]]; then
   echo -e "\n[STEP 3/5] Locating restriction motifs ($MOTIF)..."
   seqkit locate -P -d -i -j "$THREADS" -p "$MOTIF" --bed "$POREC_FQ" | \
@@ -166,7 +166,7 @@ if [[ ! -e step3.done ]]; then
         split(line, a, "\t"); r = a[1]; len = a[2]
       }
       x = $2 + off
-      if (x > 0 && x < len) print $1, len, $2, $3, x      # x = 0 ou x = longueur : rien à couper
+      if (x > 0 && x < len) print $1, len, $2, $3, x      # x = 0 or x = length: nothing to cut
     }' > sites.tsv
   touch step3.done
 fi
@@ -174,13 +174,13 @@ N_MOTIFS=$(if [[ -e step4.done ]]; then $GZ -dc sites.final.tsv.gz | wc -l; else
 echo "  -> Candidate motif sites     : $N_MOTIFS"
 
 # ------------------------------------------------------------------------------
-# STEP 4: PROTECTION DES SITES PAR LES READS HIFI (bedtools map)
+# STEP 4: SITE PROTECTION BY HIFI READS (bedtools map)
 # ------------------------------------------------------------------------------
-#  span = nb de reads HiFi DISTINCTS dont un bloc continu couvre ENTIÈREMENT
-#         [x-FLANK, x+FLANK] (fenêtre tronquée aux extrémités du read)
-#  P (protégé) : span >= MIN_COV -> pas de coupe
-#  C (coupé)   : span <  MIN_COV -> coupe, y compris sans aucun read HiFi
-# sites.final.tsv.gz : read  longueur  début_motif  fin_motif  x  span  classe
+#  span = number of DISTINCT HiFi reads with a continuous block covering
+#         [x-FLANK, x+FLANK] ENTIRELY (window truncated at read ends)
+#  P (protected): span >= MIN_COV -> not cut
+#  C (cut)      : span <  MIN_COV -> cut, including when no HiFi read is present
+# sites.final.tsv.gz: read  length  motif_start  motif_end  x  span  class
 if [[ ! -e step4.done ]]; then
   echo -e "\n[STEP 4/5] Computing HiFi protection at each site (bedtools map)..."
   paste sites.tsv \
@@ -200,13 +200,13 @@ echo "  -> Protected sites (>= $MIN_COV HiFi) : $N_PROT ($(pct "$N_PROT" "$N_MOT
 echo "  -> Cut sites (< $MIN_COV HiFi)        : $N_CUT ($(pct "$N_CUT" "$N_MOTIFS")%)"
 
 # ------------------------------------------------------------------------------
-# STEP 5: DÉCOUPE + FILTRE DES PSEUDO-MONOMÈRES + PAIRES ALL-TO-ALL
+# STEP 5: CUTTING + PSEUDO-MONOMER FILTER + ALL-TO-ALL PAIRS
 # ------------------------------------------------------------------------------
-# Tous les sites non protégés sont coupés. Un motif voisin d'une vraie jonction
-# (à moins de ~FLANK pb) n'est pas protégé non plus : entre les deux coupes naît
-# un pseudo-monomère de quelques pb. Les monomères < MIN_MONO_LEN sont écartés
-# AVANT l'appariement (ils ne sont de toute façon pas mappables).
-# Un read de n monomères retenus donne n(n-1)/2 paires @read:i-j/1 et /2.
+# Every unprotected site is cut. A motif lying within ~FLANK bp of a real
+# junction is not protected either: a pseudo-monomer of a few bp appears between
+# the two cuts. Monomers < MIN_MONO_LEN are dropped BEFORE pairing (they are not
+# mappable anyway). A read with n kept monomers gives n(n-1)/2 pairs
+# @read:i-j/1 and /2.
 if [[ ! -e step5.done ]]; then
   echo -e "\n[STEP 5/5] Cutting reads & writing all-to-all pseudo-Hi-C pairs..."
   seqkit fx2tab -i -j "$THREADS" "$POREC_FQ" | \

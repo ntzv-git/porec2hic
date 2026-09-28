@@ -1,149 +1,236 @@
 # porec2hic
 
-Découpe des reads Pore-C en monomères aux **vraies jonctions de ligation**, validées par
-les reads HiFi, puis conversion **all-to-all** des monomères en paires pseudo-Hi-C
-(R1/R2).
+Splits Pore-C reads into monomers at restriction sites, **keeping the sites that HiFi
+reads show to be genomic**, then turns the monomers of each read into **all-to-all**
+pseudo-Hi-C read pairs (R1/R2).
 
 ```bash
 POREC_FQ=porec.fq.gz HIFI_FQ=hifi.fq.gz THREADS=96 ./porec2hic_hifi.sh
-# -> porec2hic_out/porec_hic_R1.fastq.gz, porec_hic_R2.fastq.gz, sites.final.tsv.gz
+# -> porec2hic_out/porec_hic_R1.fastq.gz, porec_hic_R2.fastq.gz,
+#    porec_hic_monomers.fastq.gz, sites.final.tsv.gz
 ```
 
-Outils : `minimap2`, `seqkit`, `bedtools` (≥ 2.26), `gawk`, `pigz` (facultatif).
-Le pipeline ne contient aucun script Python.
+Requirements: `minimap2`, `seqkit`, `bedtools` (≥ 2.26), `gawk`, and optionally `pigz`.
+No Python.
 
-## Étapes
+## Steps
 
-| étape | outil | sortie |
+| step | tools | output |
 |---|---|---|
-| 1. longueurs des reads | `seqkit fx2tab -n -l` | `porec.genome` (ordre du FASTQ) |
-| 2. alignement Pore-C → HiFi | `minimap2 -c -N` + `gawk` | `hifi_blocks.bed.gz` : blocs continus de chaque read HiFi, en coordonnées Pore-C |
-| 3. sites de restriction | `seqkit locate` + `awk` | position de coupure exacte `x = début motif + CUT_OFFSET` |
-| 4. protection HiFi | `bedtools map -f 1.0 -o count_distinct` | `sites.final.tsv.gz` (`span`, classe P/C) |
-| 5. découpe, filtre des pseudo-monomères, paires all-to-all | `seqkit fx2tab` + `awk` | R1/R2 |
+| 1. read lengths | `seqkit fx2tab -n -l` | `porec.genome` (FASTQ order) |
+| 2. Pore-C → HiFi alignment | `minimap2 -c -N` + `gawk` | `hifi_blocks.bed.gz`: continuous blocks of each HiFi read, in Pore-C coordinates |
+| 3. restriction sites | `seqkit locate` + `awk` | exact cut position `x = motif start + CUT_OFFSET` |
+| 4. HiFi protection | `bedtools map -f 1.0 -o count_distinct` | `sites.final.tsv.gz` (`span`, class P/C) |
+| 5. cutting, pseudo-monomer filter, all-to-all pairs | `seqkit fx2tab` + `awk` | R1/R2, monomers |
 
-Tous les fichiers restent dans l'ordre du FASTQ Pore-C, et `bedtools map -g porec.genome`
-travaille dans cet ordre : il n'y a aucun tri global. Chaque étape écrit un fichier
-`stepN.done`, donc une relance reprend là où le pipeline s'est arrêté.
+- **No global sort:** all files stay in Pore-C FASTQ order, and
+  `bedtools map -g porec.genome` works in that order.
+- **Resume:** each step writes a `stepN.done` file, so a re-run resumes where it stopped.
 
-## Définition d'un read HiFi « continu » à travers un site
+## When is a HiFi read "continuous" across a site?
 
-Les reads Pore-C (requêtes) sont alignés sur les reads HiFi (cibles), avec `-N` pour
-garder les autres reads HiFi du même locus. Chaque alignement est ensuite converti en
-**blocs continus**, en coordonnées sur le read Pore-C :
+Pore-C reads (queries) are aligned on HiFi reads (targets). `-N` keeps the other HiFi
+reads of the same locus. Each alignment is then turned into **continuous blocks**, in
+Pore-C read coordinates:
 
-1. l'alignement est coupé à chaque indel ≥ `MAX_GAP` (lu dans le CIGAR, option `-c`) ;
-2. les blocs d'un **même read HiFi**, sur le même brin, qui sont colinéaires et séparés
-   de moins de `MAX_GAP` sur le Pore-C **et** sur le HiFi sont fusionnés.
+1. the alignment is split at every indel ≥ `MAX_GAP`, read from the CIGAR (`-c`);
+2. blocks of the **same HiFi read**, on the same strand, are merged when they are
+   colinear and separated by less than `MAX_GAP` on the Pore-C read **and** on the HiFi
+   read.
 
-Conséquences pour un read HiFi aligné sur les bases qui flanquent un site :
+What this means for a HiFi read aligned on the bases flanking a site:
 
-| situation | lecture | effet |
+| situation | meaning | protects the site? |
 |---|---|---|
-| un seul bloc couvre `[x-FLANK, x+FLANK]` | le HiFi lit la séquence à travers le site : CATG génomique | compte pour la protection |
-| deux blocs du même read HiFi, colinéaires, trou < `MAX_GAP` (erreur de séquençage Pore-C sur le site) | fusionnés : continu | compte pour la protection |
-| deux blocs du même read HiFi avec un saut ≥ `MAX_GAP`, ou sur des brins différents (ligation cis à courte distance, inversion) | non continu | ne protège pas |
-| blocs de reads HiFi différents, l'un finit avant `x` et l'autre commence après | signature d'une jonction | ne protège pas |
-| un bloc dépasse `x` de moins de `FLANK` pb | débordement d'alignement, pas une preuve de continuité | ne protège pas |
+| one block covers `[x-FLANK, x+FLANK]` | the HiFi read reads through the site: genomic motif | yes |
+| two blocks of the same HiFi read, colinear, hole < `MAX_GAP` (e.g. a Pore-C sequencing error on the site) | merged, so continuous | yes |
+| two blocks of the same HiFi read with a jump ≥ `MAX_GAP`, or on different strands (short-range cis ligation, inversion) | not continuous | no |
+| blocks from different HiFi reads, one ending before `x` and the other starting after it | typical junction | no |
+| a block that passes `x` by less than `FLANK` bp | alignment overshoot, not evidence of continuity | no |
 
-## Règle de coupure
+### `MAX_GAP`
 
-| classe | condition | action |
+`MAX_GAP` (default 50 bp) is the size of a hole, meaning an insertion or deletion
+between the Pore-C read and the HiFi read, from which the HiFi read is no longer
+considered continuous.
+
+- **Why it is needed.** Take a ligation between two fragments that are close in the
+  genome, in the same orientation, for example 300 bp apart. minimap2 aligns it on a
+  single HiFi read with a 300 bp deletion. Without `MAX_GAP`, that HiFi read would look
+  continuous and would protect the junction.
+- **Why 50 bp.** Nanopore and HiFi indel errors are much shorter than this, and 50 bp is
+  the usual threshold for a structural variant.
+- **Heterozygous structural variants.** A site next to a heterozygous SV of 50 bp or more
+  is broken only for reads of the other haplotype. Reads from the same haplotype still
+  protect it.
+
+## Cutting rule
+
+| class | condition | action |
 |---|---|---|
-| **P** protégé | `span ≥ MIN_COV` : au moins `MIN_COV` (3) reads HiFi **distincts** ont un bloc continu couvrant entièrement `[x-FLANK, x+FLANK]` | pas de coupe |
-| **C** coupé | `span < MIN_COV`, y compris quand aucun read HiFi n'est présent | **coupe** |
+| **P** protected | `span ≥ MIN_COV`: at least `MIN_COV` (3) **distinct** HiFi reads have a continuous block covering `[x-FLANK, x+FLANK]` entirely | not cut |
+| **C** cut | `span < MIN_COV`, including when no HiFi read is present | **cut** |
 
-Aux extrémités d'un read Pore-C, la fenêtre est tronquée à la séquence disponible.
+At Pore-C read ends, the window is truncated to the available sequence.
 
-Cette règle privilégie les coupures : un site mal couvert par les HiFi est coupé. Sur la
-simulation, 99,4 % des jonctions dont le motif est intact sont coupées (rappel 95,7 %
-en comptant les motifs altérés par une erreur de séquençage). Il y a 787 coupes sur des
-CATG génomiques, pour 7 295 vraies jonctions coupées :
+This rule favours cutting: a site poorly covered by HiFi reads is cut. On simulated data
+(400 kb genome, 20x HiFi, 3,000 concatemers with 1% errors):
 
-- 552 sont à moins de 20 pb d'une vraie jonction (voir ci-dessous) ;
-- 235 sont ailleurs, sur des sites couverts par 0 à 2 reads HiFi seulement.
+- **Real junctions:** 99.4% of junctions with an intact motif are cut. Recall is 95.7%
+  if junctions whose motif was altered by a sequencing error are counted too.
+- **Genomic motifs cut by mistake:** 787, for 7,295 real junctions cut.
+  - 552 lie less than 20 bp from a real junction (see *Pseudo-monomers*).
+  - 235 lie elsewhere, on sites covered by only 0 to 2 HiFi reads.
 
-## Pseudo-monomères
+## Choice of `FLANK`
 
-Un CATG situé à moins de ~`FLANK` pb d'une vraie jonction n'est traversé par aucun read
-HiFi avec la marge requise. Il est donc coupé lui aussi, et entre les deux coupes naît
-un **pseudo-monomère** de quelques pb. Taille des monomères sur la simulation :
+At an NlaIII junction, the CATG motif belongs to **both** ligated fragments. A HiFi
+alignment therefore runs past the junction by at least 4 bp, plus a few chance matches.
+`FLANK` must be larger than this overshoot.
 
-| longueur (pb) | 0–4 | 5–9 | 10–14 | 15–19 | 20–24 | 25–29 | 30–49 |
-|---|---|---|---|---|---|---|---|
-| pseudo-monomères (artefacts) | 4 | 132 | 304 | 131 | 18 | 16 | 69 |
-| vrais monomères | 0 | 24 | 63 | 76 | 43 | 35 | 185 |
+Overshoot of HiFi blocks past a real junction (simulation, minimap2 2.28 `-c`):
 
-Leur taille maximale vaut environ `FLANK` + longueur du motif (19 pb pour CATG). Les
-monomères de moins de `MIN_MONO_LEN` (par défaut `FLANK` + longueur du motif + 1 = 20 pb)
-sont donc écartés **avant** l'appariement. Les vrais monomères de cette taille ne sont de
-toute façon pas mappables de manière unique. Pour ne rien filtrer, utiliser
-`MIN_MONO_LEN=1`.
-
-## Choix de `FLANK`
-
-À une jonction NlaIII, le motif CATG appartient aux **deux** fragments ligués. Un
-alignement HiFi dépasse donc la jonction d'au moins 4 pb, plus quelques bases qui
-correspondent par hasard. `FLANK` doit être supérieur à ce débordement.
-
-Débordement des blocs HiFi au-delà d'une vraie jonction (simulation, minimap2 2.28 `-c`) :
-
-| débordement (pb) | 1 | 2 | 3 | **4** | 5 | 6 | 7 | 8 | 9 | 10 | 11–15 | > 15 |
+| overshoot (bp) | 1 | 2 | 3 | **4** | 5 | 6 | 7 | 8 | 9 | 10 | 11–15 | > 15 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| % des blocs | 14 | 5 | 2 | **56** | 14 | 4 | 1,2 | 1,2 | 0,8 | 0,5 | 1 | < 0,5 |
+| % of blocks | 14 | 5 | 2 | **56** | 14 | 4 | 1.2 | 1.2 | 0.8 | 0.5 | 1 | < 0.5 |
 
-Résultat selon `FLANK` (précision et rappel des coupes, mesurés avec la version
-précédente de la règle de coupure) :
+- **Too small:** real junctions get protected because of the overshoot. With `FLANK=5`,
+  27% of junctions are missed.
+- **Too large:** more motifs close to a junction become unprotected, which produces
+  longer pseudo-monomers.
 
-| FLANK | 0 | 5 | 10 | **15** | 20 | 25 | 50 |
+The default is 15 bp.
+
+## Pseudo-monomers
+
+A motif lying less than about `FLANK` bp from a real junction is not crossed by any HiFi
+read with the required margin. It is therefore cut too, and a **pseudo-monomer** of a few
+bp appears between the two cuts. Monomer lengths on the simulation:
+
+| length (bp) | 0–4 | 5–9 | 10–14 | 15–19 | 20–24 | 25–29 | 30–49 |
 |---|---|---|---|---|---|---|---|
-| précision | 71 % | 97,4 % | 97,9 % | **97,9 %** | 97,8 % | 97,7 % | 97,2 % |
-| rappel | 5 % | 69 % | 91,8 % | **92,7 %** | 92,1 % | 91,4 % | 87,6 % |
+| pseudo-monomers | 4 | 132 | 304 | 131 | 18 | 16 | 69 |
+| real monomers | 0 | 24 | 63 | 76 | 43 | 35 | 185 |
 
-- Une fenêtre trop petite fait protéger les vraies jonctions (débordement).
-- Une fenêtre trop grande fait tomber davantage de motifs voisins d'une jonction sous le
-  seuil, ce qui crée des pseudo-monomères plus longs.
-- Valeur par défaut : 15 pb. Le rappel manquant correspond surtout aux jonctions dont le
-  motif a été altéré par une erreur de séquençage (≈ 4 %), qui ne peuvent pas être
-  coupées au motif.
+- **Filter threshold.** Pseudo-monomers are at most about `FLANK` + motif length long
+  (19 bp for CATG with `FLANK=15`). Monomers shorter than `MIN_MONO_LEN` (default
+  `FLANK` + motif length + 1 = 20 bp) are therefore dropped **before** pairing.
+- **Cost.** Real monomers of that size cannot be mapped uniquely anyway.
+- **To disable:** `MIN_MONO_LEN=1`.
 
-## Découpe et paires
+## Pairs
 
-- `CUT_OFFSET` est la position de coupure dans le motif : NlaIII `CATG^` = 4,
+- **Cut position.** `CUT_OFFSET` is the cut position inside the motif: NlaIII `CATG^` = 4,
   DpnII `^GATC` = 0.
-- `DUP_MOTIF=1` : le motif reconstitué à la ligation est gardé sur les deux monomères
-  (`…CATG | CATG…`).
-- Seul filtrage : les pseudo-monomères de moins de `MIN_MONO_LEN`. Tous les autres
-  monomères sont gardés, et un read de n monomères retenus donne n(n-1)/2 paires
-  `@read:i-j/1` et `@read:i-j/2`. Les autres filtres (MAPQ, distance…) se font en aval
-  sur les paires.
-- Avec `WRITE_MONOMERS=1`, le FASTQ des monomères retenus est aussi écrit.
+- **Motif on both sides.** With `DUP_MOTIF=1`, the motif rebuilt by ligation is kept on
+  both monomers (`…CATG | CATG…`), so each monomer matches its genomic sequence exactly.
+- **All-to-all pairs.** A read with n kept monomers gives n(n-1)/2 pairs, named
+  `@read:i-j/1` and `@read:i-j/2`, where i and j are the monomer ranks in the read.
+- **Orientation.** R2 is written in the same orientation as the Pore-C read, not reverse
+  complemented. This does not matter for contact maps.
 
-## Paramètres
+## Parameters
 
-| variable | défaut | rôle |
+| variable | default | role |
 |---|---|---|
-| `MOTIF` / `CUT_OFFSET` | `CATG` / 4 | enzyme (motif palindromique, IUPAC accepté) |
-| `MIN_COV` | 3 | reads HiFi continus nécessaires pour protéger un site ; sinon coupure |
-| `FLANK` | 15 | marge de continuité (pb) |
-| `MAX_GAP` | 50 | indel/trou (pb) qui interrompt la continuité |
-| `MIN_MONO_LEN` | `FLANK` + motif + 1 (20) | monomères écartés avant l'appariement |
-| `MM2_PRESET` | `map-ont` | `lr:hq` pour ONT R10 Q20+ |
-| `MM2_N` | 100 | secondaires minimap2 ; plafond **par read Pore-C**, prévoir ≈ `MIN_COV` × nb de monomères × 5 |
-| `MM2_BATCH` | 50G | lots d'index HiFi (`-I` avec `--split-prefix`) |
+| `MOTIF` / `CUT_OFFSET` | `CATG` / 4 | enzyme (palindromic motif, IUPAC codes allowed) |
+| `MIN_COV` | 3 | continuous HiFi reads needed to protect a site; otherwise the site is cut |
+| `FLANK` | 15 | continuity margin (bp) |
+| `MAX_GAP` | 50 | indel/hole (bp) that breaks continuity |
+| `MIN_MONO_LEN` | `FLANK` + motif + 1 (20) | shorter monomers are dropped before pairing |
+| `DUP_MOTIF` | 1 | keep the motif on both monomers |
+| `WRITE_MONOMERS` | 1 | write `porec_hic_monomers.fastq.gz` (used by the QC below) |
+| `MM2_PRESET` | `map-ont` | `lr:hq` for ONT R10 Q20+ reads |
+| `MM2_N` | 100 | minimap2 secondary hits. The cap applies **per Pore-C read**; aim for about `MIN_COV` × number of monomers × 5 |
+| `MM2_BATCH` | 50G | HiFi index batch size (`-I` with `--split-prefix`) |
+| `MM2_EXTRA` | – | extra minimap2 options |
 
-## Coût
+## Cost
 
-Le volume d'alignements est d'environ (nombre de monomères Pore-C) × (profondeur HiFi),
-avec CIGAR. Pour `MIN_COV=3`, 10–15x de HiFi suffisent : sous-échantillonner
-(`seqkit sample`) réduit d'autant le temps de minimap2 et la taille de
-`hifi_blocks.bed.gz`.
+- **Volume.** Step 2 produces about (number of Pore-C monomers) × (HiFi depth)
+  alignments, with CIGAR.
+- **Subsampling HiFi.** With `MIN_COV=3`, 10–15x of HiFi is enough. Subsampling the HiFi
+  reads (`seqkit sample`) reduces minimap2 time and the size of `hifi_blocks.bed.gz`
+  accordingly.
 
-## Test
+## Recommended post-analysis checks and filters
+
+### 1. HiFi support at the sites (`sites.final.tsv.gz`)
 
 ```bash
-tests/run_test.sh /tmp/porec2hic_test   # simulation + pipeline + précision/rappel
+zcat porec2hic_out/sites.final.tsv.gz | cut -f6 | sort -n | uniq -c   # distribution of span
 ```
 
-La simulation et l'évaluation (`tests/*.py`) sont en Python, mais elles ne font pas
-partie du pipeline.
+Expect a bimodal distribution:
+
+- **span = 0:** real junctions.
+- **Peak near the HiFi depth (≤ `MM2_N`):** genomic sites.
+- **Many sites at 1 to 2 (< `MIN_COV`):** these are cut for lack of HiFi support, and most
+  of them are false cuts. Add HiFi data, increase `MM2_N`, or lower `MIN_COV`.
+
+### 2. False-cut rate
+
+A false cut splits a genomic fragment into two monomers that map **contiguously** on the
+genome. Map the monomers (`porec_hic_monomers.fastq.gz`, in read order) on the assembly
+and count consecutive monomers of the same read that map end to end:
+
+```bash
+minimap2 -x map-ont -t 32 --secondary=no assembly.fa porec2hic_out/porec_hic_monomers.fastq.gz | \
+awk -v tol=100 '
+  $1 == q { next }                                   # best line of each monomer only
+  { q = $1; n = split($1, a, "_"); id = substr($1, 1, length($1) - length(a[n-1]) - length(a[n]) - 2) }
+  $12 < 10 { pid = ""; next }                        # MAPQ < 10: not usable
+  {
+    if (id == pid) {
+      tested++
+      if ($6 == pt && $5 == ps) {                    # same contig, same strand, end to end
+        gap = ($5 == "+") ? ($8 - $3) - (pte + (pql - pqe)) : (pts - (pql - pqe)) - ($9 + $3)
+        if (gap > -tol && gap < tol) contig++
+      }
+    }
+    pid = id; pt = $6; ps = $5; pts = $8; pte = $9; pql = $2; pqe = $4
+  }
+  END { printf "consecutive monomers: %d, contiguous on the assembly: %d (%.2f%%)\n", tested, contig, 100 * contig / tested }'
+```
+
+- **Reading the result.** The contiguous fraction is an upper bound of the false-cut rate,
+  because it also includes real re-ligations of adjacent fragments. On the simulation it
+  is 1.6%.
+- **If it is high:** increase HiFi coverage or `MM2_N`, or lower `MIN_COV`.
+
+### 3. Mapping the pairs
+
+```bash
+bwa mem -5SP -T0 -t 32 assembly.fa porec_hic_R1.fastq.gz porec_hic_R2.fastq.gz | \
+  pairtools parse --min-mapq 30 --walks-policy 5unique --max-inter-align-gap 30 \
+                  --chroms-path assembly.genome | pairtools sort -o porec_hic.pairs.gz
+```
+
+- **Do not run `pairtools dedup`.** Every monomer starts and ends at a restriction site,
+  so independent molecules often give pairs with identical coordinates. Removing them as
+  "duplicates" would discard real contacts. Pore-C has no PCR step anyway.
+- **MAPQ.** Filter on MAPQ (≥ 30 for contact maps, ≥ 1–10 for scaffolding).
+- **Self-ligation and neighbouring fragments.** These are not informative. Remove cis
+  pairs closer than about 1 kb:
+
+  ```bash
+  pairtools select '(chrom1 != chrom2) or (abs(pos1 - pos2) >= 1000)'
+  ```
+
+### 4. Weight of highly fragmented reads
+
+A read with n monomers contributes n(n-1)/2 pairs, so a few highly fragmented reads can
+dominate. The read name carries the monomer ranks (`read:i-j`). Pairs can be filtered
+before mapping, keeping R1 and R2 in sync. For example, to keep only direct ligations
+(`j = i + 1`):
+
+```bash
+paste <(zcat porec_hic_R1.fastq.gz | paste - - - -) <(zcat porec_hic_R2.fastq.gz | paste - - - -) | \
+awk -F'\t' '{ split($1, a, ":"); split(a[length(a)], b, /[-\/]/); if (b[2] == b[1] + 1) print }' | \
+tee >(cut -f1-4 | tr '\t' '\n' | gzip > direct_R1.fastq.gz) | cut -f5-8 | tr '\t' '\n' | gzip > direct_R2.fastq.gz
+```
+
+- **Cap on fragmentation.** The same approach can cap the number of monomers per read
+  (maximum `j`).
+- **Distribution.** The `step5.stats` file and the `monomers/read` line of the log give
+  the fragmentation distribution.
