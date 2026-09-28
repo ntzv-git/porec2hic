@@ -5,7 +5,7 @@ out = sys.argv[1] if len(sys.argv) > 1 else "out"
 truth = json.load(open("truth.json"))
 seen = collections.defaultdict(dict)
 for l in gzip.open(f"{out}/sites.final.tsv.gz", "rt"):
-    r, ln, ms, me, x, sp, cl, cr, c = l.split()
+    r, ln, ms, me, x, sp, c = l.split()
     seen[r][int(x)] = c
 cls_true, cls_gen = collections.Counter(), collections.Counter()
 for r, js in truth.items():
@@ -15,5 +15,5 @@ for r, js in truth.items():
     cls_true["absent (motif muté)"] += sum(j not in seen[r] for j in js)
 print("vraies jonctions :", dict(cls_true))
 print("sites génomiques :", dict(cls_gen))
-tp, fp = cls_true["J"], cls_gen["J"]
+tp, fp = cls_true["C"], cls_gen["C"]
 print(f"précision={tp / (tp + fp):.4f} rappel={tp / sum(cls_true.values()):.4f}")

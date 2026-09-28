@@ -5,7 +5,7 @@ les reads HiFi, puis conversion **all-to-all** des monomères en paires pseudo-H
 (R1/R2).
 
 ```bash
-POREC_FILE=porec.fq.gz HIFI_FQ=hifi.fq.gz THREADS=96 ./porec2hic_hifi.sh
+POREC_FQ=porec.fq.gz HIFI_FQ=hifi.fq.gz THREADS=96 ./porec2hic_hifi.sh
 # -> porec2hic_out/porec_hic_R1.fastq.gz, porec_hic_R2.fastq.gz, sites.final.tsv.gz
 ```
 
@@ -19,9 +19,8 @@ Le pipeline ne contient aucun script Python.
 | 1. longueurs des reads | `seqkit fx2tab -n -l` | `porec.genome` (ordre du FASTQ) |
 | 2. alignement Pore-C → HiFi | `minimap2 -c -N` + `gawk` | `hifi_blocks.bed.gz` : blocs continus de chaque read HiFi, en coordonnées Pore-C |
 | 3. sites de restriction | `seqkit locate` + `awk` | position de coupure exacte `x = début motif + CUT_OFFSET` |
-| 4. continuité HiFi au site | `bedtools map` (×3) | `span`, `covL`, `covR` |
-| 5. un seul site par jonction | `bedtools map -o collapse` + `gawk` | `sites.final.tsv.gz` |
-| 6. découpe + paires all-to-all | `seqkit fx2tab` + `awk` | R1/R2 |
+| 4. protection HiFi | `bedtools map -f 1.0 -o count_distinct` | `sites.final.tsv.gz` (`span`, classe P/C) |
+| 5. découpe, filtre des pseudo-monomères, paires all-to-all | `seqkit fx2tab` + `awk` | R1/R2 |
 
 Tous les fichiers restent dans l'ordre du FASTQ Pore-C, et `bedtools map -g porec.genome`
 travaille dans cet ordre : il n'y a aucun tri global. Chaque étape écrit un fichier
@@ -43,20 +42,43 @@ Conséquences pour un read HiFi aligné sur les bases qui flanquent un site :
 |---|---|---|
 | un seul bloc couvre `[x-FLANK, x+FLANK]` | le HiFi lit la séquence à travers le site : CATG génomique | compte pour la protection |
 | deux blocs du même read HiFi, colinéaires, trou < `MAX_GAP` (erreur de séquençage Pore-C sur le site) | fusionnés : continu | compte pour la protection |
-| deux blocs du même read HiFi avec un saut ≥ `MAX_GAP`, ou sur des brins différents (ligation cis à courte distance, inversion) | non continu | compte seulement comme couverture latérale |
-| blocs de reads HiFi différents, l'un finit avant `x` et l'autre commence après | signature d'une jonction | couverture latérale (`covL`/`covR`) |
-| un bloc dépasse `x` de moins de `FLANK` pb | débordement d'alignement, pas une preuve de continuité | couverture latérale |
+| deux blocs du même read HiFi avec un saut ≥ `MAX_GAP`, ou sur des brins différents (ligation cis à courte distance, inversion) | non continu | ne protège pas |
+| blocs de reads HiFi différents, l'un finit avant `x` et l'autre commence après | signature d'une jonction | ne protège pas |
+| un bloc dépasse `x` de moins de `FLANK` pb | débordement d'alignement, pas une preuve de continuité | ne protège pas |
 
-## Classes des sites
+## Règle de coupure
 
 | classe | condition | action |
 |---|---|---|
-| **P** protégé | `span ≥ MIN_COV` : au moins `MIN_COV` reads HiFi **distincts** ont un bloc continu couvrant entièrement `[x-FLANK, x+FLANK]` | pas de coupe |
-| **J** jonction | `span < MIN_COV` et au moins `MIN_SIDE_COV` reads HiFi distincts ont un bloc dans `[x-SIDE_WINDOW, x)` ou dans `[x, x+SIDE_WINDOW)` | **coupe** |
-| **j** motif voisin d'une jonction | site J à moins de `2×FLANK` d'un autre site J : on garde celui le plus proche du point de cassure des blocs HiFi | pas de coupe |
-| **U** non résolu | pas assez de reads HiFi autour du site | pas de coupe (`CUT_UNRESOLVED=1` pour couper) |
+| **P** protégé | `span ≥ MIN_COV` : au moins `MIN_COV` (3) reads HiFi **distincts** ont un bloc continu couvrant entièrement `[x-FLANK, x+FLANK]` | pas de coupe |
+| **C** coupé | `span < MIN_COV`, y compris quand aucun read HiFi n'est présent | **coupe** |
 
 Aux extrémités d'un read Pore-C, la fenêtre est tronquée à la séquence disponible.
+
+Cette règle privilégie les coupures : un site mal couvert par les HiFi est coupé. Sur la
+simulation, 99,4 % des jonctions dont le motif est intact sont coupées (rappel 95,7 %
+en comptant les motifs altérés par une erreur de séquençage). Il y a 787 coupes sur des
+CATG génomiques, pour 7 295 vraies jonctions coupées :
+
+- 552 sont à moins de 20 pb d'une vraie jonction (voir ci-dessous) ;
+- 235 sont ailleurs, sur des sites couverts par 0 à 2 reads HiFi seulement.
+
+## Pseudo-monomères
+
+Un CATG situé à moins de ~`FLANK` pb d'une vraie jonction n'est traversé par aucun read
+HiFi avec la marge requise. Il est donc coupé lui aussi, et entre les deux coupes naît
+un **pseudo-monomère** de quelques pb. Taille des monomères sur la simulation :
+
+| longueur (pb) | 0–4 | 5–9 | 10–14 | 15–19 | 20–24 | 25–29 | 30–49 |
+|---|---|---|---|---|---|---|---|
+| pseudo-monomères (artefacts) | 4 | 132 | 304 | 131 | 18 | 16 | 69 |
+| vrais monomères | 0 | 24 | 63 | 76 | 43 | 35 | 185 |
+
+Leur taille maximale vaut environ `FLANK` + longueur du motif (19 pb pour CATG). Les
+monomères de moins de `MIN_MONO_LEN` (par défaut `FLANK` + longueur du motif + 1 = 20 pb)
+sont donc écartés **avant** l'appariement. Les vrais monomères de cette taille ne sont de
+toute façon pas mappables de manière unique. Pour ne rien filtrer, utiliser
+`MIN_MONO_LEN=1`.
 
 ## Choix de `FLANK`
 
@@ -70,7 +92,8 @@ Débordement des blocs HiFi au-delà d'une vraie jonction (simulation, minimap2 
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | % des blocs | 14 | 5 | 2 | **56** | 14 | 4 | 1,2 | 1,2 | 0,8 | 0,5 | 1 | < 0,5 |
 
-Résultat selon `FLANK` (précision et rappel des coupes) :
+Résultat selon `FLANK` (précision et rappel des coupes, mesurés avec la version
+précédente de la règle de coupure) :
 
 | FLANK | 0 | 5 | 10 | **15** | 20 | 25 | 50 |
 |---|---|---|---|---|---|---|---|
@@ -79,7 +102,7 @@ Résultat selon `FLANK` (précision et rappel des coupes) :
 
 - Une fenêtre trop petite fait protéger les vraies jonctions (débordement).
 - Une fenêtre trop grande fait tomber davantage de motifs voisins d'une jonction sous le
-  seuil ; la plupart sont rattrapés à l'étape 5 (classe `j`).
+  seuil, ce qui crée des pseudo-monomères plus longs.
 - Valeur par défaut : 15 pb. Le rappel manquant correspond surtout aux jonctions dont le
   motif a été altéré par une erreur de séquençage (≈ 4 %), qui ne peuvent pas être
   coupées au motif.
@@ -90,21 +113,21 @@ Résultat selon `FLANK` (précision et rappel des coupes) :
   DpnII `^GATC` = 0.
 - `DUP_MOTIF=1` : le motif reconstitué à la ligation est gardé sur les deux monomères
   (`…CATG | CATG…`).
-- **Aucun filtrage** : tous les monomères sont gardés, quelle que soit leur taille, et
-  un read de n monomères donne n(n-1)/2 paires `@read:i-j/1` et `@read:i-j/2`. Les
-  filtres (taille, MAPQ, distance…) se font en aval sur les paires.
-- Avec `WRITE_MONOMERS=1`, le FASTQ des monomères est aussi écrit.
+- Seul filtrage : les pseudo-monomères de moins de `MIN_MONO_LEN`. Tous les autres
+  monomères sont gardés, et un read de n monomères retenus donne n(n-1)/2 paires
+  `@read:i-j/1` et `@read:i-j/2`. Les autres filtres (MAPQ, distance…) se font en aval
+  sur les paires.
+- Avec `WRITE_MONOMERS=1`, le FASTQ des monomères retenus est aussi écrit.
 
 ## Paramètres
 
 | variable | défaut | rôle |
 |---|---|---|
 | `MOTIF` / `CUT_OFFSET` | `CATG` / 4 | enzyme (motif palindromique, IUPAC accepté) |
-| `MIN_COV` | 3 | reads HiFi continus nécessaires pour protéger un site |
+| `MIN_COV` | 3 | reads HiFi continus nécessaires pour protéger un site ; sinon coupure |
 | `FLANK` | 15 | marge de continuité (pb) |
 | `MAX_GAP` | 50 | indel/trou (pb) qui interrompt la continuité |
-| `MIN_SIDE_COV` / `SIDE_WINDOW` | `MIN_COV` / 100 | preuve HiFi à côté d'une jonction |
-| `CUT_UNRESOLVED` | 0 | couper aussi les sites U |
+| `MIN_MONO_LEN` | `FLANK` + motif + 1 (20) | monomères écartés avant l'appariement |
 | `MM2_PRESET` | `map-ont` | `lr:hq` pour ONT R10 Q20+ |
 | `MM2_N` | 100 | secondaires minimap2 ; plafond **par read Pore-C**, prévoir ≈ `MIN_COV` × nb de monomères × 5 |
 | `MM2_BATCH` | 50G | lots d'index HiFi (`-I` avec `--split-prefix`) |

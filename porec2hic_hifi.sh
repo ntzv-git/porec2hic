@@ -2,7 +2,7 @@
 # ==============================================================================
 #  HIFI-GUIDED PORE-C DIGESTION -> ALL-TO-ALL PSEUDO-HI-C PAIRS
 # ==============================================================================
-#  Usage : POREC_FILE=porec.fq.gz HIFI_FQ=hifi.fq.gz ./porec2hic_hifi.sh
+#  Usage : POREC_FQ=porec.fq.gz HIFI_FQ=hifi.fq.gz ./porec2hic_hifi.sh
 #  Outils : minimap2, seqkit, bedtools, gawk, (pigz). Aucun script python.
 #  Toutes les variables ci-dessous peuvent être surchargées par l'environnement.
 #  Chaque étape laisse un fichier stepN.done : une relance reprend là où elle s'est arrêtée.
@@ -16,7 +16,7 @@ export LC_ALL=C
 # ------------------------------------------------------------------------------
 # VARIABLES DU PIPELINE
 # ------------------------------------------------------------------------------
-POREC_FILE=${POREC_FILE:?"POREC_FILE non défini"}
+POREC_FQ=${POREC_FQ:?"POREC_FQ non défini"}
 HIFI_FQ=${HIFI_FQ:?"HIFI_FQ non défini (FASTQ/FASTA HiFi ou index .mmi)"}
 OUTDIR=${OUTDIR:-porec2hic_out}
 PREFIX=${PREFIX:-porec_hic}
@@ -25,12 +25,10 @@ MOTIF=${MOTIF:-CATG}              # motif palindromique, IUPAC accepté (GATC, G
 CUT_OFFSET=${CUT_OFFSET:-4}       # coupure dans le motif : NlaIII CATG^ = 4, DpnII ^GATC = 0
 DUP_MOTIF=${DUP_MOTIF:-1}         # 1 = le motif reconstitué à la ligation est gardé sur les 2 monomères
 
-MIN_COV=${MIN_COV:-3}             # reads HiFi continus sur [x-FLANK, x+FLANK] pour PROTÉGER le site
+MIN_COV=${MIN_COV:-3}             # site PROTÉGÉ si >= MIN_COV reads HiFi continus sur [x-FLANK, x+FLANK] ; sinon coupé
 FLANK=${FLANK:-15}                # marge (pb) exigée de part et d'autre du site (> longueur motif + débordement)
 MAX_GAP=${MAX_GAP:-50}            # indel/trou (pb) au-delà duquel un alignement HiFi n'est plus continu
-MIN_SIDE_COV=${MIN_SIDE_COV:-$MIN_COV}  # reads HiFi d'un côté du site pour valider une JONCTION
-SIDE_WINDOW=${SIDE_WINDOW:-100}   # fenêtre (pb) de chaque côté du site pour compter ces reads
-CUT_UNRESOLVED=${CUT_UNRESOLVED:-0}     # 1 = couper aussi les sites sans information HiFi
+MIN_MONO_LEN=${MIN_MONO_LEN:-$(( FLANK + ${#MOTIF} + 1 ))}  # < FLANK+motif : pseudo-monomères écartés avant l'appariement
 WRITE_MONOMERS=${WRITE_MONOMERS:-0}     # 1 = écrire aussi le FASTQ des monomères
 
 THREADS=${THREADS:-96}
@@ -50,18 +48,18 @@ if [[ "${RC^^}" != "${MOTIF^^}" ]]; then
 fi
 MOTIF_LEN=${#MOTIF}
 
-POREC_FILE=$(realpath "$POREC_FILE"); HIFI_FQ=$(realpath "$HIFI_FQ")
+POREC_FQ=$(realpath "$POREC_FQ"); HIFI_FQ=$(realpath "$HIFI_FQ")
 mkdir -p "$OUTDIR"
 cd "$OUTDIR"
 
 echo "======================================================================"
 echo "      STARTING HIFI-GUIDED PORE-C DIGESTION PIPELINE (UNIX/BASH)"
 echo "======================================================================"
-echo "Pore-C File   : $POREC_FILE"
+echo "Pore-C File   : $POREC_FQ"
 echo "HiFi File     : $HIFI_FQ"
 echo "Motif         : $MOTIF (Cut Offset: $CUT_OFFSET, motif on both monomers: $DUP_MOTIF)"
-echo "Protection    : >= $MIN_COV HiFi reads continuous over site +/- ${FLANK}bp (gaps < ${MAX_GAP}bp)"
-echo "Junction      : < $MIN_COV continuous and >= $MIN_SIDE_COV HiFi reads within ${SIDE_WINDOW}bp on one side"
+echo "Protection    : >= $MIN_COV HiFi reads continuous over site +/- ${FLANK}bp (gaps < ${MAX_GAP}bp), otherwise cut"
+echo "Min monomer   : ${MIN_MONO_LEN}bp (shorter monomers removed before pairing)"
 echo "Threads       : $THREADS"
 echo "Output dir    : $PWD"
 echo "======================================================================"
@@ -70,8 +68,8 @@ echo "======================================================================"
 # STEP 1: LONGUEURS DES READS PORE-C (ordre du FASTQ = ordre de tri pour bedtools)
 # ------------------------------------------------------------------------------
 if [[ ! -e step1.done ]]; then
-  echo -e "\n[STEP 1/6] Extracting Pore-C read lengths..."
-  seqkit fx2tab -n -i -l -j "$THREADS" "$POREC_FILE" | cut -f1,2 > porec.genome
+  echo -e "\n[STEP 1/5] Extracting Pore-C read lengths..."
+  seqkit fx2tab -n -i -l -j "$THREADS" "$POREC_FQ" | cut -f1,2 > porec.genome
   touch step1.done
 fi
 read -r N_POREC TOT_BP < <(awk '{n++; s += $2} END {print n + 0, s + 0}' porec.genome)
@@ -91,10 +89,10 @@ echo "  -> Total bases / mean length : $TOT_BP bp / $(awk -v t="$TOT_BP" -v n="$
 #   read_porec  début  fin  read_hifi
 BLOCKS=hifi_blocks.bed.gz
 if [[ ! -e step2.done ]]; then
-  echo -e "\n[STEP 2/6] Aligning Pore-C reads on HiFi reads (minimap2 -c, $MM2_PRESET)..."
+  echo -e "\n[STEP 2/5] Aligning Pore-C reads on HiFi reads (minimap2 -c, $MM2_PRESET)..."
   mkdir -p mm2_tmp
   minimap2 -c -x "$MM2_PRESET" -t "$THREADS" -I "$MM2_BATCH" --split-prefix mm2_tmp/split \
-      --secondary=yes -N "$MM2_N" $MM2_EXTRA "$HIFI_FQ" "$POREC_FILE" 2> minimap2.log | \
+      --secondary=yes -N "$MM2_N" $MM2_EXTRA "$HIFI_FQ" "$POREC_FQ" 2> minimap2.log | \
   gawk -v G="$MAX_GAP" -v LONG="[0-9]{${#MAX_GAP},}[IDN]" '
     BEGIN { OFS = "\t" }
     function add(q1, q2, t1, t2) {
@@ -159,8 +157,8 @@ echo "  -> Pore-C reads with HiFi alignments : $N_ALN_READS"
 # ------------------------------------------------------------------------------
 # sites.tsv : read  longueur  début_motif  fin_motif  x   (x = coupure = début + CUT_OFFSET)
 if [[ ! -e step3.done ]]; then
-  echo -e "\n[STEP 3/6] Locating restriction motifs ($MOTIF)..."
-  seqkit locate -P -d -i -j "$THREADS" -p "$MOTIF" --bed "$POREC_FILE" | \
+  echo -e "\n[STEP 3/5] Locating restriction motifs ($MOTIF)..."
+  seqkit locate -P -d -i -j "$THREADS" -p "$MOTIF" --bed "$POREC_FQ" | \
   awk -v off="$CUT_OFFSET" -v G=porec.genome 'BEGIN { OFS = "\t" }
     {
       while ($1 != r) {
@@ -172,103 +170,48 @@ if [[ ! -e step3.done ]]; then
     }' > sites.tsv
   touch step3.done
 fi
-N_MOTIFS=$(if [[ -e step5.done ]]; then $GZ -dc sites.final.tsv.gz | wc -l; else wc -l < sites.tsv; fi)
+N_MOTIFS=$(if [[ -e step4.done ]]; then $GZ -dc sites.final.tsv.gz | wc -l; else wc -l < sites.tsv; fi)
 echo "  -> Candidate motif sites     : $N_MOTIFS"
 
 # ------------------------------------------------------------------------------
-# STEP 4: CLASSIFICATION DES SITES PAR LES READS HIFI (bedtools map)
+# STEP 4: PROTECTION DES SITES PAR LES READS HIFI (bedtools map)
 # ------------------------------------------------------------------------------
-#  span = reads HiFi distincts dont un bloc continu couvre ENTIÈREMENT [x-FLANK, x+FLANK]
-#  covL = reads HiFi distincts avec un bloc dans [x-SIDE_WINDOW, x)
-#  covR = reads HiFi distincts avec un bloc dans [x, x+SIDE_WINDOW)
-#  P (protégé)   : span >= MIN_COV
-#  J (jonction)  : span <  MIN_COV et max(covL, covR) >= MIN_SIDE_COV
-#  U (non résolu): sinon (pas assez de HiFi autour du site)
-MAP="bedtools map -g porec.genome -b $BLOCKS -c 4 -o count_distinct"
+#  span = nb de reads HiFi DISTINCTS dont un bloc continu couvre ENTIÈREMENT
+#         [x-FLANK, x+FLANK] (fenêtre tronquée aux extrémités du read)
+#  P (protégé) : span >= MIN_COV -> pas de coupe
+#  C (coupé)   : span <  MIN_COV -> coupe, y compris sans aucun read HiFi
+# sites.final.tsv.gz : read  longueur  début_motif  fin_motif  x  span  classe
 if [[ ! -e step4.done ]]; then
-  echo -e "\n[STEP 4/6] Computing HiFi continuity at each site (bedtools map)..."
+  echo -e "\n[STEP 4/5] Computing HiFi protection at each site (bedtools map)..."
   paste sites.tsv \
     <(awk -v f="$FLANK" 'BEGIN { OFS = "\t" } { s = $5 - f; e = $5 + f; print $1, (s < 0 ? 0 : s), (e > $2 ? $2 : e) }' sites.tsv \
-        | $MAP -f 1.0 -a - | cut -f4) \
-    <(awk -v w="$SIDE_WINDOW" 'BEGIN { OFS = "\t" } { s = $5 - w; print $1, (s < 0 ? 0 : s), $5 }' sites.tsv \
-        | $MAP -a - | cut -f4) \
-    <(awk -v w="$SIDE_WINDOW" 'BEGIN { OFS = "\t" } { e = $5 + w; print $1, $5, (e > $2 ? $2 : e) }' sites.tsv \
-        | $MAP -a - | cut -f4) | \
-  awk -v mc="$MIN_COV" -v ms="$MIN_SIDE_COV" 'BEGIN { OFS = "\t" }
-    NF != 8 { print "ERROR: bedtools map output truncated at line " NR > "/dev/stderr"; exit 1 }
-    { c = ($6 >= mc) ? "P" : (($7 >= ms || $8 >= ms) ? "J" : "U"); print $0, c }' > sites.cls.tsv
-  [[ $(wc -l < sites.cls.tsv) -eq $N_MOTIFS ]] || { echo "ERROR: sites.cls.tsv incomplete" >&2; exit 1; }
+        | bedtools map -g porec.genome -b "$BLOCKS" -c 4 -o count_distinct -f 1.0 -a - | cut -f4) | \
+  awk -v mc="$MIN_COV" 'BEGIN { OFS = "\t" }
+    NF != 6 { print "ERROR: bedtools map output truncated at line " NR > "/dev/stderr"; exit 1 }
+    { print $0, ($6 >= mc ? "P" : "C") }' | $GZ > sites.final.tsv.gz
+  [[ $($GZ -dc sites.final.tsv.gz | wc -l) -eq $N_MOTIFS ]] || { echo "ERROR: sites.final.tsv.gz incomplete" >&2; exit 1; }
+  rm -f sites.tsv
   touch step4.done
 fi
 
-# ------------------------------------------------------------------------------
-# STEP 5: UN SEUL SITE PAR JONCTION
-# ------------------------------------------------------------------------------
-# Un autre motif à moins de 2*FLANK d'une jonction n'est pas non plus traversé
-# par les HiFi. Dans une grappe de sites J rapprochés, on garde le site le plus
-# proche du point de cassure = milieu entre la médiane des fins des blocs HiFi
-# à gauche et la médiane des débuts des blocs HiFi à droite. Les autres -> "j".
-if [[ ! -e step5.done ]]; then
-  echo -e "\n[STEP 5/6] Resolving clusters of junction sites..."
-  awk -v f="$FLANK" 'BEGIN { OFS = "\t" }
-    function out(   i) { if (nb > 1) for (i = 1; i <= nb; i++) print buf[i]; nb = 0 }
-    $9 != "J" { out(); next }
-    { if (nb && ($1 != pr || $5 - px >= 2 * f)) out(); buf[++nb] = $1 "\t" $2 "\t" $5; pr = $1; px = $5 }
-    END { out() }' sites.cls.tsv > clusters.tsv
-  # fins de blocs autour de x (gauche) et débuts de blocs autour de x (droite)
-  paste clusters.tsv \
-    <(awk -v f="$FLANK" -v w="$SIDE_WINDOW" 'BEGIN { OFS = "\t" } { s = $3 - w; e = $3 + f; print $1, (s < 0 ? 0 : s), (e > $2 ? $2 : e) }' clusters.tsv \
-        | bedtools map -g porec.genome -b "$BLOCKS" -c 3 -o collapse -a - | cut -f4) \
-    <(awk -v f="$FLANK" -v w="$SIDE_WINDOW" 'BEGIN { OFS = "\t" } { s = $3 - f; e = $3 + w; print $1, (s < 0 ? 0 : s), (e > $2 ? $2 : e) }' clusters.tsv \
-        | bedtools map -g porec.genome -b "$BLOCKS" -c 2 -o collapse -a - | cut -f4) | \
-  gawk -v f="$FLANK" -v w="$SIDE_WINDOW" 'BEGIN { OFS = "\t" }
-    function med(list, lo, hi,   n, i, v, k) {
-      n = split(list, v, ","); k = 0; delete M
-      for (i = 1; i <= n; i++) if (v[i] != "." && v[i] >= lo && v[i] <= hi) M[++k] = v[i] + 0
-      if (!k) return ""
-      asort(M)
-      return M[int((k + 1) / 2)]
-    }
-    {
-      e = med($4, $3 - w, $3 + f); s = med($5, $3 - f, $3 + w)
-      b = (e != "" && s != "") ? (e + s) / 2 : (e != "" ? e : (s != "" ? s : $3))
-      print $1, $3, b
-    }' > clusters.bp.tsv
-
-  awk -v f="$FLANK" -v BP=clusters.bp.tsv 'BEGIN { OFS = "\t"; while ((getline l < BP) > 0) { split(l, a, "\t"); B[a[1] SUBSEP a[2]] = a[3] } }
-    function d(i,   v) { v = xs[i] - B[rd SUBSEP xs[i]]; return v < 0 ? -v : v }
-    function out(   i, best) {
-      if (nb > 1) { best = 1; for (i = 2; i <= nb; i++) if (d(i) < d(best)) best = i
-                    for (i = 1; i <= nb; i++) if (i != best) sub(/J$/, "j", buf[i]) }
-      for (i = 1; i <= nb; i++) print buf[i]
-      nb = 0
-    }
-    $9 != "J" { out(); print; next }
-    { if (nb && ($1 != rd || $5 - xs[nb] >= 2 * f)) out(); rd = $1; buf[++nb] = $0; xs[nb] = $5 }
-    END { out() }' sites.cls.tsv | $GZ > sites.final.tsv.gz
-  rm -f clusters.tsv clusters.bp.tsv sites.cls.tsv sites.tsv
-  touch step5.done
-fi
-
-declare -A C=([P]=0 [J]=0 [j]=0 [U]=0)
-while read -r k v; do C[$k]=$v; done < <($GZ -dc sites.final.tsv.gz | awk '{c[$9]++} END {for (k in c) print k, c[k]}')
+read -r N_PROT N_CUT < <($GZ -dc sites.final.tsv.gz | awk '$7 == "P" { p++ } $7 == "C" { c++ } END { print p + 0, c + 0 }')
 pct() { awk -v a="$1" -v b="$2" 'BEGIN { if (b > 0) printf "%.2f", 100 * a / b; else print 0 }'; }
-echo "  -> Protected sites (P)          : ${C[P]} ($(pct "${C[P]}" "$N_MOTIFS")%)"
-echo "  -> HiFi-validated junctions (J) : ${C[J]} ($(pct "${C[J]}" "$N_MOTIFS")%)"
-echo "  -> Motifs next to a junction (j): ${C[j]} ($(pct "${C[j]}" "$N_MOTIFS")%)  -> not cut"
-echo "  -> Unresolved, no HiFi info (U) : ${C[U]} ($(pct "${C[U]}" "$N_MOTIFS")%)  -> $([[ $CUT_UNRESOLVED == 1 ]] && echo cut || echo 'not cut')"
+echo "  -> Protected sites (>= $MIN_COV HiFi) : $N_PROT ($(pct "$N_PROT" "$N_MOTIFS")%)"
+echo "  -> Cut sites (< $MIN_COV HiFi)        : $N_CUT ($(pct "$N_CUT" "$N_MOTIFS")%)"
 
 # ------------------------------------------------------------------------------
-# STEP 6: DÉCOUPE + PAIRES ALL-TO-ALL (seqkit fx2tab + awk, une passe, sans filtre)
+# STEP 5: DÉCOUPE + FILTRE DES PSEUDO-MONOMÈRES + PAIRES ALL-TO-ALL
 # ------------------------------------------------------------------------------
-# Tous les monomères sont conservés, quelle que soit leur taille : le filtrage se
-# fait en aval sur les paires. Un read de n monomères donne n(n-1)/2 paires.
-if [[ ! -e step6.done ]]; then
-  echo -e "\n[STEP 6/6] Cutting reads & writing all-to-all pseudo-Hi-C pairs..."
-  CUT_CLASSES="J"; [[ "$CUT_UNRESOLVED" == 1 ]] && CUT_CLASSES="JU"
-  seqkit fx2tab -i -j "$THREADS" "$POREC_FILE" | \
-  awk -v CUTS=<($GZ -dc sites.final.tsv.gz | awk -v cc="$CUT_CLASSES" 'index(cc, $9) { print $1 "\t" $3 "\t" $4 "\t" $5 }') \
-      -v dup="$DUP_MOTIF" -v wm="$WRITE_MONOMERS" \
+# Tous les sites non protégés sont coupés. Un motif voisin d'une vraie jonction
+# (à moins de ~FLANK pb) n'est pas protégé non plus : entre les deux coupes naît
+# un pseudo-monomère de quelques pb. Les monomères < MIN_MONO_LEN sont écartés
+# AVANT l'appariement (ils ne sont de toute façon pas mappables).
+# Un read de n monomères retenus donne n(n-1)/2 paires @read:i-j/1 et /2.
+if [[ ! -e step5.done ]]; then
+  echo -e "\n[STEP 5/5] Cutting reads & writing all-to-all pseudo-Hi-C pairs..."
+  seqkit fx2tab -i -j "$THREADS" "$POREC_FQ" | \
+  awk -v CUTS=<($GZ -dc sites.final.tsv.gz | awk '$7 == "C" { print $1 "\t" $3 "\t" $4 "\t" $5 }') \
+      -v dup="$DUP_MOTIF" -v minlen="$MIN_MONO_LEN" -v wm="$WRITE_MONOMERS" \
       -v c1="$GZ > ${PREFIX}_R1.fastq.gz" -v c2="$GZ > ${PREFIX}_R2.fastq.gz" -v cm="$GZ > ${PREFIX}_monomers.fastq.gz" '
     BEGIN { FS = "\t"; more = ((getline cl < CUTS) > 0) }
     {
@@ -280,46 +223,48 @@ if [[ ! -e step6.done ]]; then
         more = ((getline cl < CUTS) > 0)
       }
       n = 0; beg = 0
-      for (k = 1; k <= nc; k++) {
-        end = dup ? ME[k] : X[k]
-        if (end > beg) { n++; S[n] = beg; E[n] = end }
-        beg = dup ? MS[k] : X[k]
-      }
-      if (L > beg) { n++; S[n] = beg; E[n] = L }
-      reads++; mono += n
-      if (n == 1) single++
-      for (i = 1; i <= n; i++) {
-        sq[i] = substr(seq, S[i] + 1, E[i] - S[i]); ql[i] = substr(qual, S[i] + 1, E[i] - S[i])
-        if (wm) print "@" id "_" S[i] "_" E[i] "\n" sq[i] "\n+\n" ql[i] | cm
-      }
-      if (n >= 2) {
-        multi++
-        for (i = 1; i <= n; i++)
-          for (j = i + 1; j <= n; j++) {
-            tag = "@" id ":" i "-" j
-            print tag "/1\n" sq[i] "\n+\n" ql[i] | c1
-            print tag "/2\n" sq[j] "\n+\n" ql[j] | c2
-            pairs++
+      for (k = 1; k <= nc + 1; k++) {
+        end = (k > nc) ? L : (dup ? ME[k] : X[k])
+        if (end > beg) {
+          mono++
+          if (end - beg < minlen) short++
+          else {
+            n++; sq[n] = substr(seq, beg + 1, end - beg); ql[n] = substr(qual, beg + 1, end - beg)
+            if (wm) print "@" id "_" beg "_" end "\n" sq[n] "\n+\n" ql[n] | cm
           }
+        }
+        if (k <= nc) beg = dup ? MS[k] : X[k]
       }
+      reads++; kept += n
+      if (n < 2) { single++; next }
+      multi++
+      for (i = 1; i <= n; i++)
+        for (j = i + 1; j <= n; j++) {
+          tag = "@" id ":" i "-" j
+          print tag "/1\n" sq[i] "\n+\n" ql[i] | c1
+          print tag "/2\n" sq[j] "\n+\n" ql[j] | c2
+          pairs++
+        }
     }
     END {
       if (more) { print "ERROR: cut list not exhausted (" cl ") -> order mismatch with the FASTQ" > "/dev/stderr"; exit 1 }
       close(c1); close(c2); if (wm) close(cm)
-      print reads + 0, mono + 0, multi + 0, single + 0, pairs + 0 > "step6.stats"
+      print reads + 0, mono + 0, short + 0, kept + 0, multi + 0, single + 0, pairs + 0 > "step5.stats"
     }'
-  touch step6.done
+  touch step5.done
 fi
 
-read -r READS MONO MULTI SINGLE PAIRS < step6.stats
-echo "  -> Monomers generated          : $MONO ($(awk -v m="$MONO" -v r="$READS" 'BEGIN {printf "%.2f", r ? m / r : 0}') monomers/read)"
-echo "  -> Multi-monomer reads         : $MULTI"
-echo "  -> Single-monomer reads        : $SINGLE (no pair possible)"
+read -r READS MONO SHORT KEPT MULTI SINGLE PAIRS < step5.stats
+echo "  -> Monomers generated            : $MONO"
+echo "  -> Monomers < ${MIN_MONO_LEN}bp removed     : $SHORT"
+echo "  -> Monomers kept                 : $KEPT ($(awk -v m="$KEPT" -v r="$READS" 'BEGIN {printf "%.2f", r ? m / r : 0}') monomers/read)"
+echo "  -> Multi-monomer reads           : $MULTI"
+echo "  -> Reads with < 2 monomers       : $SINGLE (no pair possible)"
 echo "  -> Pseudo-Hi-C pairs (all-to-all): $PAIRS"
-echo "  -> Output files                : $PWD/${PREFIX}_R1.fastq.gz ($(du -h "${PREFIX}_R1.fastq.gz" | cut -f1))"
-echo "                                   $PWD/${PREFIX}_R2.fastq.gz ($(du -h "${PREFIX}_R2.fastq.gz" | cut -f1))"
-echo "  -> Per-site table              : $PWD/sites.final.tsv.gz"
-echo "     (read len motif_start motif_end cut span covL covR class)"
+echo "  -> Output files                  : $PWD/${PREFIX}_R1.fastq.gz ($(du -h "${PREFIX}_R1.fastq.gz" | cut -f1))"
+echo "                                     $PWD/${PREFIX}_R2.fastq.gz ($(du -h "${PREFIX}_R2.fastq.gz" | cut -f1))"
+echo "  -> Per-site table                : $PWD/sites.final.tsv.gz"
+echo "     (read len motif_start motif_end cut span class)"
 echo "======================================================================"
 echo "                   ALL PIPELINE STEPS COMPLETED"
 echo "======================================================================"

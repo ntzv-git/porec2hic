@@ -8,6 +8,6 @@ W=${1:-$(mktemp -d)}
 mkdir -p "$W"
 cd "$W"
 [[ -s porec.fq.gz ]] || python3 "$HERE/simulate.py" "$W"
-THREADS=${THREADS:-4} POREC_FILE=porec.fq.gz HIFI_FQ=hifi.fq.gz OUTDIR=${OUTDIR:-out} \
+THREADS=${THREADS:-4} POREC_FQ=porec.fq.gz HIFI_FQ=hifi.fq.gz OUTDIR=${OUTDIR:-out} \
   bash "$HERE/../porec2hic_hifi.sh"
 python3 "$HERE/eval.py" "${OUTDIR:-out}"
