@@ -5,12 +5,14 @@
 #  Usage : POREC_FQ=porec.fq.gz HIFI_FQ=hifi.fq.gz ./porec2hic_hifi.sh
 #  Tools: minimap2, seqkit, bedtools, gawk, (pigz). No Python.
 #  Every variable below can be overridden from the environment.
-#  Each step writes a stepN.done file: a re-run resumes where it stopped.
+#  Resume: each step writes its output under a temporary name and renames it
+#  only on success. A step whose output file exists is skipped, so a re-run
+#  after a crash resumes at the first missing output.
 #
 #  All intermediate files stay in Pore-C FASTQ order (bedtools map -g
 #  porec.genome): no global sort is needed.
 # ==============================================================================
-set -euo pipefail
+set -Eeuo pipefail
 export LC_ALL=C
 
 # ------------------------------------------------------------------------------
@@ -48,12 +50,34 @@ if [[ "${RC^^}" != "${MOTIF^^}" ]]; then
 fi
 MOTIF_LEN=${#MOTIF}
 
+# ------------------------------------------------------------------------------
+# LOGGING, TIMING AND RESUME HELPERS
+# ------------------------------------------------------------------------------
+log() { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+hms() { printf '%02d:%02d:%02d' $(( $1 / 3600 )) $(( $1 % 3600 / 60 )) $(( $1 % 60 )); }
+STEP_NAME="setup"; STEP_TIMES=()
+RERUN=0                                   # once a step runs, every later step runs again
+done_already() { [[ $RERUN == 0 ]] && for f in "$@"; do [[ -e "$f" ]] || return 1; done; }
+step_begin() { STEP_NAME=$1; STEP_START=$SECONDS; RERUN=1; echo; log "[$1] $2"; }
+step_end() {
+  local d=$(( SECONDS - STEP_START ))
+  STEP_TIMES+=("$STEP_NAME|$(hms "$d")")
+  log "[$STEP_NAME] done in $(hms "$d")"
+}
+step_skip() { STEP_TIMES+=("$1|skipped (output present)"); echo; log "[$1] $2 -> $3 already present, step skipped"; }
+trap 'log "ERROR: pipeline failed during $STEP_NAME (line $LINENO); re-run the same command to resume" >&2' ERR
+kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; kill "$1" 2>/dev/null || true; }
+trap 'log "INTERRUPTED during $STEP_NAME; re-run the same command to resume" >&2; trap - INT TERM ERR
+      for c in $(pgrep -P $$); do kill_tree "$c"; done; exit 130' INT TERM
+
 POREC_FQ=$(realpath "$POREC_FQ"); HIFI_FQ=$(realpath "$HIFI_FQ")
 mkdir -p "$OUTDIR"
 cd "$OUTDIR"
 
+PIPELINE_START=$SECONDS
 echo "======================================================================"
 echo "      STARTING HIFI-GUIDED PORE-C DIGESTION PIPELINE (UNIX/BASH)"
+echo "      $(date '+%Y-%m-%d %H:%M:%S')"
 echo "======================================================================"
 echo "Pore-C File   : $POREC_FQ"
 echo "HiFi File     : $HIFI_FQ"
@@ -62,19 +86,26 @@ echo "Protection    : >= $MIN_COV HiFi reads continuous over site +/- ${FLANK}bp
 echo "Min monomer   : ${MIN_MONO_LEN}bp (shorter monomers removed before pairing)"
 echo "Threads       : $THREADS"
 echo "Output dir    : $PWD"
+echo "Index batch   : $MM2_BATCH"
 echo "======================================================================"
 
 # ------------------------------------------------------------------------------
 # STEP 1: PORE-C READ LENGTHS (FASTQ order = sort order used by bedtools)
 # ------------------------------------------------------------------------------
-if [[ ! -e step1.done ]]; then
-  echo -e "\n[STEP 1/5] Extracting Pore-C read lengths..."
-  seqkit fx2tab -n -i -l -j "$THREADS" "$POREC_FQ" | cut -f1,2 > porec.genome
-  touch step1.done
+if done_already porec.genome; then
+  step_skip "STEP 1/5" "Pore-C read lengths" porec.genome
+else
+  step_begin "STEP 1/5" "Extracting Pore-C read lengths..."
+  (   # run in the background so that a stop signal is handled immediately
+  trap - ERR INT TERM
+  seqkit fx2tab -n -i -l -j "$THREADS" "$POREC_FQ" | cut -f1,2 > porec.genome.tmp
+  mv porec.genome.tmp porec.genome
+  ) & wait $!
+  step_end
 fi
 read -r N_POREC TOT_BP < <(awk '{n++; s += $2} END {print n + 0, s + 0}' porec.genome)
-echo "  -> Pore-C reads input        : $N_POREC"
-echo "  -> Total bases / mean length : $TOT_BP bp / $(awk -v t="$TOT_BP" -v n="$N_POREC" 'BEGIN {printf "%.1f", n ? t / n : 0}') bp"
+log "  -> Pore-C reads input        : $N_POREC"
+log "  -> Total bases / mean length : $TOT_BP bp / $(awk -v t="$TOT_BP" -v n="$N_POREC" 'BEGIN {printf "%.1f", n ? t / n : 0}') bp"
 
 # ------------------------------------------------------------------------------
 # STEP 2: PORE-C READS (query) ALIGNED ON HIFI READS (target) -> CONTINUOUS BLOCKS
@@ -88,9 +119,13 @@ echo "  -> Total bases / mean length : $TOT_BP bp / $(awk -v t="$TOT_BP" -v n="$
 # Output (FASTQ order, sorted by start within each read):
 #   porec_read  start  end  hifi_read
 BLOCKS=hifi_blocks.bed.gz
-if [[ ! -e step2.done ]]; then
-  echo -e "\n[STEP 2/5] Aligning Pore-C reads on HiFi reads (minimap2 -c, $MM2_PRESET)..."
-  mkdir -p mm2_tmp
+if done_already "$BLOCKS"; then
+  step_skip "STEP 2/5" "Pore-C -> HiFi alignment" "$BLOCKS"
+else
+  step_begin "STEP 2/5" "Aligning Pore-C reads on HiFi reads (minimap2 -c, $MM2_PRESET)..."
+  (   # run in the background so that a stop signal is handled immediately
+  trap - ERR INT TERM
+  rm -rf mm2_tmp; mkdir -p mm2_tmp
   minimap2 -c -x "$MM2_PRESET" -t "$THREADS" -I "$MM2_BATCH" --split-prefix mm2_tmp/split \
       --secondary=yes -N "$MM2_N" $MM2_EXTRA "$HIFI_FQ" "$POREC_FQ" 2> minimap2.log | \
   gawk -v G="$MAX_GAP" -v LONG="[0-9]{${#MAX_GAP},}[IDN]" '
@@ -145,19 +180,25 @@ if [[ ! -e step2.done ]]; then
       }
       add((st == "+") ? bq : qp, (st == "+") ? qp : bq, bt, tp)
     }
-    END { flush() }' | $GZ > "$BLOCKS"
+    END { flush() }' | $GZ > "$BLOCKS.tmp"
+  mv "$BLOCKS.tmp" "$BLOCKS"
   rm -rf mm2_tmp
-  touch step2.done
+  ) & wait $!
+  step_end
 fi
 N_ALN_READS=$($GZ -dc "$BLOCKS" | cut -f1 | uniq | wc -l)
-echo "  -> Pore-C reads with HiFi alignments : $N_ALN_READS"
+log "  -> Pore-C reads with HiFi alignments : $N_ALN_READS"
 
 # ------------------------------------------------------------------------------
 # STEP 3: RESTRICTION SITES (exact cut position)
 # ------------------------------------------------------------------------------
 # sites.tsv: read  length  motif_start  motif_end  x   (x = cut = motif_start + CUT_OFFSET)
-if [[ ! -e step3.done ]]; then
-  echo -e "\n[STEP 3/5] Locating restriction motifs ($MOTIF)..."
+if done_already sites.tsv || done_already sites.final.tsv.gz; then
+  step_skip "STEP 3/5" "Restriction motifs" "$([[ -e sites.tsv ]] && echo sites.tsv || echo sites.final.tsv.gz)"
+else
+  step_begin "STEP 3/5" "Locating restriction motifs ($MOTIF)..."
+  (   # run in the background so that a stop signal is handled immediately
+  trap - ERR INT TERM
   seqkit locate -P -d -i -j "$THREADS" -p "$MOTIF" --bed "$POREC_FQ" | \
   awk -v off="$CUT_OFFSET" -v G=porec.genome 'BEGIN { OFS = "\t" }
     {
@@ -167,11 +208,13 @@ if [[ ! -e step3.done ]]; then
       }
       x = $2 + off
       if (x > 0 && x < len) print $1, len, $2, $3, x      # x = 0 or x = length: nothing to cut
-    }' > sites.tsv
-  touch step3.done
+    }' > sites.tsv.tmp
+  mv sites.tsv.tmp sites.tsv
+  ) & wait $!
+  step_end
 fi
-N_MOTIFS=$(if [[ -e step4.done ]]; then $GZ -dc sites.final.tsv.gz | wc -l; else wc -l < sites.tsv; fi)
-echo "  -> Candidate motif sites     : $N_MOTIFS"
+N_MOTIFS=$(if [[ -e sites.final.tsv.gz ]]; then $GZ -dc sites.final.tsv.gz | wc -l; else wc -l < sites.tsv; fi)
+log "  -> Candidate motif sites     : $N_MOTIFS"
 
 # ------------------------------------------------------------------------------
 # STEP 4: SITE PROTECTION BY HIFI READS (bedtools map)
@@ -181,23 +224,29 @@ echo "  -> Candidate motif sites     : $N_MOTIFS"
 #  P (protected): span >= MIN_COV -> not cut
 #  C (cut)      : span <  MIN_COV -> cut, including when no HiFi read is present
 # sites.final.tsv.gz: read  length  motif_start  motif_end  x  span  class
-if [[ ! -e step4.done ]]; then
-  echo -e "\n[STEP 4/5] Computing HiFi protection at each site (bedtools map)..."
+if done_already sites.final.tsv.gz; then
+  step_skip "STEP 4/5" "HiFi protection" sites.final.tsv.gz
+else
+  step_begin "STEP 4/5" "Computing HiFi protection at each site (bedtools map)..."
+  (   # run in the background so that a stop signal is handled immediately
+  trap - ERR INT TERM
   paste sites.tsv \
     <(awk -v f="$FLANK" 'BEGIN { OFS = "\t" } { s = $5 - f; e = $5 + f; print $1, (s < 0 ? 0 : s), (e > $2 ? $2 : e) }' sites.tsv \
         | bedtools map -g porec.genome -b "$BLOCKS" -c 4 -o count_distinct -f 1.0 -a - | cut -f4) | \
   awk -v mc="$MIN_COV" 'BEGIN { OFS = "\t" }
     NF != 6 { print "ERROR: bedtools map output truncated at line " NR > "/dev/stderr"; exit 1 }
-    { print $0, ($6 >= mc ? "P" : "C") }' | $GZ > sites.final.tsv.gz
-  [[ $($GZ -dc sites.final.tsv.gz | wc -l) -eq $N_MOTIFS ]] || { echo "ERROR: sites.final.tsv.gz incomplete" >&2; exit 1; }
+    { print $0, ($6 >= mc ? "P" : "C") }' | $GZ > sites.final.tsv.gz.tmp
+  [[ $($GZ -dc sites.final.tsv.gz.tmp | wc -l) -eq $N_MOTIFS ]] || { log "ERROR: site table incomplete" >&2; exit 1; }
+  mv sites.final.tsv.gz.tmp sites.final.tsv.gz
   rm -f sites.tsv
-  touch step4.done
+  ) & wait $!
+  step_end
 fi
 
 read -r N_PROT N_CUT < <($GZ -dc sites.final.tsv.gz | awk '$7 == "P" { p++ } $7 == "C" { c++ } END { print p + 0, c + 0 }')
 pct() { awk -v a="$1" -v b="$2" 'BEGIN { if (b > 0) printf "%.2f", 100 * a / b; else print 0 }'; }
-echo "  -> Protected sites (>= $MIN_COV HiFi) : $N_PROT ($(pct "$N_PROT" "$N_MOTIFS")%)"
-echo "  -> Cut sites (< $MIN_COV HiFi)        : $N_CUT ($(pct "$N_CUT" "$N_MOTIFS")%)"
+log "  -> Protected sites (>= $MIN_COV HiFi) : $N_PROT ($(pct "$N_PROT" "$N_MOTIFS")%)"
+log "  -> Cut sites (< $MIN_COV HiFi)        : $N_CUT ($(pct "$N_CUT" "$N_MOTIFS")%)"
 
 # ------------------------------------------------------------------------------
 # STEP 5: CUTTING + PSEUDO-MONOMER FILTER + ALL-TO-ALL PAIRS
@@ -207,19 +256,25 @@ echo "  -> Cut sites (< $MIN_COV HiFi)        : $N_CUT ($(pct "$N_CUT" "$N_MOTIF
 # the two cuts. Monomers < MIN_MONO_LEN are dropped BEFORE pairing (they are not
 # mappable anyway). A read with n kept monomers gives n(n-1)/2 pairs
 # @read:i-j/1 and /2.
-if [[ ! -e step5.done ]]; then
-  echo -e "\n[STEP 5/5] Cutting reads & writing all-to-all pseudo-Hi-C pairs..."
+OUT5=("${PREFIX}_R1.fastq.gz" "${PREFIX}_R2.fastq.gz" "${PREFIX}.stats")
+[[ "$WRITE_MONOMERS" == 1 ]] && OUT5+=("${PREFIX}_monomers.fastq.gz")
+if done_already "${OUT5[@]}"; then
+  step_skip "STEP 5/5" "Cutting & all-to-all pairs" "${OUT5[*]}"
+else
+  step_begin "STEP 5/5" "Cutting reads & writing all-to-all pseudo-Hi-C pairs..."
+  (   # run in the background so that a stop signal is handled immediately
+  trap - ERR INT TERM
   seqkit fx2tab -i -j "$THREADS" "$POREC_FQ" | \
   awk -v CUTS=<($GZ -dc sites.final.tsv.gz | awk '$7 == "C" { print $1 "\t" $3 "\t" $4 "\t" $5 }') \
       -v dup="$DUP_MOTIF" -v minlen="$MIN_MONO_LEN" -v wm="$WRITE_MONOMERS" \
-      -v c1="$GZ > ${PREFIX}_R1.fastq.gz" -v c2="$GZ > ${PREFIX}_R2.fastq.gz" -v cm="$GZ > ${PREFIX}_monomers.fastq.gz" '
+      -v c1="$GZ > ${PREFIX}_R1.fastq.gz.tmp" -v c2="$GZ > ${PREFIX}_R2.fastq.gz.tmp" -v cm="$GZ > ${PREFIX}_monomers.fastq.gz.tmp" '
     BEGIN { FS = "\t"; more = ((getline cl < CUTS) > 0) }
     {
       id = $1; seq = $2; qual = $3; L = length(seq); nc = 0
       while (more) {
         split(cl, a, "\t")
         if (a[1] != id) break
-        nc++; X[nc] = a[4]; MS[nc] = a[2]; ME[nc] = a[3]
+        nc++; ncuts++; X[nc] = a[4]; MS[nc] = a[2]; ME[nc] = a[3]
         more = ((getline cl < CUTS) > 0)
       }
       n = 0; beg = 0
@@ -249,22 +304,31 @@ if [[ ! -e step5.done ]]; then
     END {
       if (more) { print "ERROR: cut list not exhausted (" cl ") -> order mismatch with the FASTQ" > "/dev/stderr"; exit 1 }
       close(c1); close(c2); if (wm) close(cm)
-      print reads + 0, mono + 0, short + 0, kept + 0, multi + 0, single + 0, pairs + 0 > "step5.stats"
+      print reads + 0, mono + 0, short + 0, kept + 0, multi + 0, single + 0, pairs + 0, ncuts + 0 > "stats.tmp"
     }'
-  touch step5.done
+  read -r _ _ _ _ _ _ _ NCUTS_DONE < stats.tmp
+  [[ $NCUTS_DONE -eq $N_CUT ]] || { log "ERROR: $NCUTS_DONE cuts applied, $N_CUT expected" >&2; exit 1; }
+  for f in "${OUT5[@]}"; do [[ "$f" == "${PREFIX}.stats" ]] || mv "$f.tmp" "$f"; done
+  mv stats.tmp "${PREFIX}.stats"                      # written last: marks the step as complete
+  ) & wait $!
+  step_end
 fi
 
-read -r READS MONO SHORT KEPT MULTI SINGLE PAIRS < step5.stats
-echo "  -> Monomers generated            : $MONO"
-echo "  -> Monomers < ${MIN_MONO_LEN}bp removed     : $SHORT"
-echo "  -> Monomers kept                 : $KEPT ($(awk -v m="$KEPT" -v r="$READS" 'BEGIN {printf "%.2f", r ? m / r : 0}') monomers/read)"
-echo "  -> Multi-monomer reads           : $MULTI"
-echo "  -> Reads with < 2 monomers       : $SINGLE (no pair possible)"
-echo "  -> Pseudo-Hi-C pairs (all-to-all): $PAIRS"
-echo "  -> Output files                  : $PWD/${PREFIX}_R1.fastq.gz ($(du -h "${PREFIX}_R1.fastq.gz" | cut -f1))"
-echo "                                     $PWD/${PREFIX}_R2.fastq.gz ($(du -h "${PREFIX}_R2.fastq.gz" | cut -f1))"
-echo "  -> Per-site table                : $PWD/sites.final.tsv.gz"
-echo "     (read len motif_start motif_end cut span class)"
+read -r READS MONO SHORT KEPT MULTI SINGLE PAIRS _ < "${PREFIX}.stats"
+log "  -> Monomers generated            : $MONO"
+log "  -> Monomers < ${MIN_MONO_LEN}bp removed       : $SHORT"
+log "  -> Monomers kept                 : $KEPT ($(awk -v m="$KEPT" -v r="$READS" 'BEGIN {printf "%.2f", r ? m / r : 0}') monomers/read)"
+log "  -> Multi-monomer reads           : $MULTI"
+log "  -> Reads with < 2 monomers       : $SINGLE (no pair possible)"
+log "  -> Pseudo-Hi-C pairs (all-to-all): $PAIRS"
+log "  -> Output files                  : $PWD/${PREFIX}_R1.fastq.gz ($(du -h "${PREFIX}_R1.fastq.gz" | cut -f1))"
+log "                                     $PWD/${PREFIX}_R2.fastq.gz ($(du -h "${PREFIX}_R2.fastq.gz" | cut -f1))"
+log "  -> Per-site table                : $PWD/sites.final.tsv.gz"
+log "     (read len motif_start motif_end cut span class)"
+echo
+log "Execution times:"
+for t in "${STEP_TIMES[@]}"; do log "  ${t%%|*} : ${t#*|}"; done
+log "  TOTAL    : $(hms $(( SECONDS - PIPELINE_START )))"
 echo "======================================================================"
-echo "                   ALL PIPELINE STEPS COMPLETED"
+echo "        ALL PIPELINE STEPS COMPLETED - $(date '+%Y-%m-%d %H:%M:%S')"
 echo "======================================================================"

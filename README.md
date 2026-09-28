@@ -8,6 +8,10 @@ pseudo-Hi-C read pairs (R1/R2).
 POREC_FQ=porec.fq.gz HIFI_FQ=hifi.fq.gz THREADS=96 ./porec2hic_hifi.sh
 # -> porec2hic_out/porec_hic_R1.fastq.gz, porec_hic_R2.fastq.gz,
 #    porec_hic_monomers.fastq.gz, sites.final.tsv.gz
+
+# in the background, e.g. with a larger HiFi index batch:
+nohup env POREC_FQ=porec.fq.gz HIFI_FQ=hifi.fq.gz MM2_BATCH=200G THREADS=96 \
+    bash ./porec2hic_hifi.sh > porec2hic.log 2>&1 &
 ```
 
 Requirements: `minimap2`, `seqkit`, `bedtools` (≥ 2.26), `gawk`, and optionally `pigz`.
@@ -25,7 +29,24 @@ No Python.
 
 - **No global sort:** all files stay in Pore-C FASTQ order, and
   `bedtools map -g porec.genome` works in that order.
-- **Resume:** each step writes a `stepN.done` file, so a re-run resumes where it stopped.
+- **Resume:** each step writes its output under a temporary name (`*.tmp`) and renames it
+  only when the step succeeds. On a re-run, a step whose output file exists is skipped.
+  As soon as one step runs again, all later steps run again too, so outputs stay
+  consistent. To redo a step, delete its output file.
+
+  | step | output checked |
+  |---|---|
+  | 1 | `porec.genome` |
+  | 2 | `hifi_blocks.bed.gz` |
+  | 3 | `sites.tsv` (or `sites.final.tsv.gz`) |
+  | 4 | `sites.final.tsv.gz` |
+  | 5 | `porec_hic_R1.fastq.gz`, `porec_hic_R2.fastq.gz`, `porec_hic.stats` (and `porec_hic_monomers.fastq.gz`) |
+
+- **Log:** every message is timestamped. The log gives the duration of each step and
+  the total time at the end. The total covers the current run only: skipped steps
+  count for 0.
+- **Stop:** on `kill` or Ctrl-C, the running step and its child processes (minimap2…)
+  are stopped at once, and the log says which step to resume.
 
 ## When is a HiFi read "continuous" across a site?
 
@@ -232,5 +253,5 @@ tee >(cut -f1-4 | tr '\t' '\n' | gzip > direct_R1.fastq.gz) | cut -f5-8 | tr '\t
 
 - **Cap on fragmentation.** The same approach can cap the number of monomers per read
   (maximum `j`).
-- **Distribution.** The `step5.stats` file and the `monomers/read` line of the log give
+- **Distribution.** The `porec_hic.stats` file and the `monomers/read` line of the log give
   the fragmentation distribution.
