@@ -38,7 +38,9 @@ MM2_PRESET=${MM2_PRESET:-map-ont} # lr:hq for ONT R10 Q20+ reads (minimap2 >= 2.
 MM2_N=${MM2_N:-200}               # secondary hits = other HiFi reads of the locus (cap is PER WINDOW)
 WINDOW=${WINDOW:-2000}            # Pore-C reads longer than this are aligned as overlapping windows (0 = off)
 WINDOW_OVERLAP=${WINDOW_OVERLAP:-250}   # overlap (bp) between consecutive windows (> 2 x FLANK)
-MM2_BATCH=${MM2_BATCH:-50G}       # HiFi index batch size (-I) with --split-prefix
+MM2_BATCH=${MM2_BATCH:-50G}       # HiFi index batch size (-I)
+MM2_SPLIT=${MM2_SPLIT:-auto}      # --split-prefix: auto = only if the HiFi reads need several index batches
+                                  # (it stores ALL alignments in temporary files until the end: huge on disk)
 MM2_EXTRA=${MM2_EXTRA:-}
 
 for tool in minimap2 seqkit bedtools gawk; do
@@ -167,8 +169,27 @@ else
   step_begin "STEP 3/6" "Aligning Pore-C reads on HiFi reads (minimap2 -c, $MM2_PRESET)..."
   (   # run in the background so that a stop signal is handled immediately
   trap - ERR INT TERM
-  rm -rf mm2_tmp; mkdir -p mm2_tmp
-  minimap2 -c -x "$MM2_PRESET" -t "$THREADS" -I "$MM2_BATCH" --split-prefix mm2_tmp/split \
+  rm -rf mm2_tmp
+  SPLIT_OPT=()
+  if [[ "$MM2_SPLIT" == 1 ]]; then
+    SPLIT_OPT=(--split-prefix mm2_tmp/split)
+  elif [[ "$MM2_SPLIT" == auto ]]; then
+    if [[ "$HIFI_FQ" == *.mmi ]]; then
+      SPLIT_OPT=(--split-prefix mm2_tmp/split)       # batch count of a prebuilt index is unknown: stay safe
+    else
+      HIFI_BP=$(seqkit stats -T -j "$THREADS" "$HIFI_FQ" | awk 'NR == 2 { print $5 }')
+      BATCH_BP=$(numfmt --from=si "${MM2_BATCH^^}")
+      log "  -> HiFi bases: $HIFI_BP ; index batch: $BATCH_BP -> $(( (HIFI_BP + BATCH_BP - 1) / BATCH_BP )) batch(es)"
+      (( HIFI_BP > BATCH_BP )) && SPLIT_OPT=(--split-prefix mm2_tmp/split)
+    fi
+  fi
+  if (( ${#SPLIT_OPT[@]} )); then
+    mkdir -p mm2_tmp
+    log "  -> several index batches: --split-prefix (temporary alignments in mm2_tmp/, output at the end)"
+  else
+    log "  -> single index batch: alignments streamed directly to $BLOCKS"
+  fi
+  minimap2 -c -x "$MM2_PRESET" -t "$THREADS" -I "$MM2_BATCH" ${SPLIT_OPT[@]+"${SPLIT_OPT[@]}"} \
       --secondary=yes -N "$MM2_N" $MM2_EXTRA "$HIFI_FQ" "$WINDOWS" 2> minimap2.log | \
   gawk -v G="$MAX_GAP" -v LONG="[0-9]{${#MAX_GAP},}[IDN]" '
     BEGIN { OFS = "\t" }
