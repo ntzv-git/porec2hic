@@ -265,7 +265,59 @@ awk -v tol=100 '
   is 1.6%.
 - **If it is high:** increase HiFi coverage or `MM2_N`, or lower `MIN_COV`.
 
-### 3. Mapping the pairs
+### 3. Missed cuts (junctions left inside monomers)
+
+A missed junction leaves a monomer made of two genomic fragments. On the Pore-C read, it
+shows up as a **hole**: a position inside a monomer that no HiFi block crosses, while
+HiFi reads align on both sides. The check below finds these holes from the pipeline
+outputs, without any new alignment. Run it inside the output directory:
+
+```bash
+F=15; M=30; W=100; MC=3        # FLANK, margin from monomer ends, side window, MIN_COV
+# regions crossed (with FLANK margin) by at least one continuous HiFi block
+zcat hifi_blocks.bed.gz | awk -v f=$F 'BEGIN{OFS="\t"} $3 - $2 > 2 * f { print $1, $2 + f, $3 - f }' \
+  | bedtools merge -i - > qc_spanned.bed
+# holes = parts of the reads crossed by no HiFi block (read ends excluded)
+bedtools complement -i qc_spanned.bed -g porec.genome \
+  | awk 'NR == FNR { L[$1] = $2; next } $2 > 0 && $3 < L[$1]' porec.genome - > qc_holes.bed
+# holes strictly inside a kept monomer (M bp away from its ends)
+zcat porec_hic_monomers.fastq.gz | awk -v m=$M 'NR % 4 == 1 { n = split(substr($1, 2), a, "_")
+    r = substr($1, 2, length($1) - length(a[n-1]) - length(a[n]) - 3)
+    if (a[n] - a[n-1] > 2 * m) print r "\t" a[n-1] + m "\t" a[n] - m }' > qc_interiors.bed
+bedtools intersect -sorted -g porec.genome -f 1.0 -u -a qc_holes.bed -b qc_interiors.bed > qc_inside.bed
+# keep holes with >= MC HiFi reads on BOTH sides (otherwise it is a HiFi coverage gap)
+paste qc_inside.bed \
+  <(awk -v w=$W 'BEGIN{OFS="\t"} { s = $2 - w; print $1, (s < 0 ? 0 : s), $2 }' qc_inside.bed \
+      | bedtools map -g porec.genome -a - -b hifi_blocks.bed.gz -c 4 -o count_distinct | cut -f4) \
+  <(awk -v w=$W 'BEGIN{OFS="\t"} { print $1, $3, $3 + w }' qc_inside.bed \
+      | bedtools map -g porec.genome -a - -b hifi_blocks.bed.gz -c 4 -o count_distinct | cut -f4) \
+  | awk -v mc=$MC '$4 >= mc && $5 >= mc' > qc_missed.bed
+CUTS=$(zcat sites.final.tsv.gz | awk '$7 == "C"' | wc -l); MISSED=$(wc -l < qc_missed.bed)
+awk -v c=$CUTS -v m=$MISSED 'BEGIN { printf "missed junctions: %d ; cuts: %d ; missed / (cuts + missed) = %.2f%%\n", m, c, 100 * m / (c + m) }'
+```
+
+Validation on the simulation (16,450 real junctions, 745 missed):
+
+- **Specificity:** 594 holes found, of which 593 are real missed junctions.
+- **Sensitivity:** 80% of missed junctions are found. The others are the protected
+  junctions (0.5%, no hole by definition) and junctions within 30 bp of a monomer end.
+- **Reading the result:** multiply the count by about 1.25 to estimate the real number of
+  missed junctions.
+- **Denominator:** it includes false cuts, so the percentage is slightly underestimated.
+
+`qc_missed.bed` lists the positions of the missed junctions, and its width column is
+informative. The check does not depend on the motif, so it also finds ligations that did
+not happen at a restriction site.
+
+Expected causes of missed cuts:
+
+| cause | expected rate | why |
+|---|---|---|
+| motif altered by a sequencing error | ≈ 1 − (1 − e)⁴: **4–8%** for Q17–Q19 reads (e = 1.2–2%) | the cut is only made on an intact motif |
+| junction protected by ≥ `MIN_COV` HiFi reads | ≈ 0.5% (simulation) | ligation of genomically adjacent fragments, alignment overshoot; can increase with homeologous copies (`-p 0.5`) |
+| ligation outside a restriction site | unknown, measured by this check | no motif to cut |
+
+### 4. Mapping the pairs
 
 ```bash
 bwa mem -5SP -T0 -t 32 assembly.fa porec_hic_R1.fastq.gz porec_hic_R2.fastq.gz | \
@@ -284,7 +336,7 @@ bwa mem -5SP -T0 -t 32 assembly.fa porec_hic_R1.fastq.gz porec_hic_R2.fastq.gz |
   pairtools select '(chrom1 != chrom2) or (abs(pos1 - pos2) >= 1000)'
   ```
 
-### 4. Weight of highly fragmented reads
+### 5. Weight of highly fragmented reads
 
 A read with n monomers contributes n(n-1)/2 pairs, so a few highly fragmented reads can
 dominate. The read name carries the monomer ranks (`read:i-j`). Pairs can be filtered
