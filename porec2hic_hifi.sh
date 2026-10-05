@@ -41,6 +41,10 @@ WINDOW_OVERLAP=${WINDOW_OVERLAP:-250}   # overlap (bp) between consecutive windo
 MM2_BATCH=${MM2_BATCH:-50G}       # HiFi index batch size (-I)
 MM2_SPLIT=${MM2_SPLIT:-auto}      # --split-prefix: auto = only if the HiFi reads need several index batches
                                   # (it stores ALL alignments in temporary files until the end: huge on disk)
+MM2_MAX_OCC=${MM2_MAX_OCC:-}     # ignore HiFi minimizers seen more than this many times (minimap2 -f INT).
+                                  # Empty = minimap2 default (top 0.02%), which gets very high with redundant
+                                  # HiFi reads / polyploids (log line "mid_occ = ..."), making step 2 slow.
+                                  # Keep it well above HiFi depth x copies (e.g. 1000).
 MM2_EXTRA=${MM2_EXTRA:-}
 
 for tool in minimap2 seqkit bedtools gawk; do
@@ -65,13 +69,38 @@ hms() { printf '%02d:%02d:%02d' $(( $1 / 3600 )) $(( $1 % 3600 / 60 )) $(( $1 % 
 STEP_NAME="setup"; STEP_TIMES=()
 RERUN=0                                   # once a step runs, every later step runs again
 done_already() { [[ $RERUN == 0 ]] && for f in "$@"; do [[ -e "$f" ]] || return 1; done; }
-step_begin() { STEP_NAME=$1; STEP_START=$SECONDS; RERUN=1; echo; log "[$1] $2"; }
+step_begin() {
+  STEP_NAME=$1; STEP_START=$SECONDS; RERUN=1; echo; log "[$1] $2"
+  case $1 in                             # cached counts derived from this step and the next ones are obsolete
+    "STEP 1/5") rm -f counts.tsv ;;
+    "STEP 2/5") for k in aligned_reads sites prot_cut; do kv_del counts.tsv "$k"; done ;;
+    "STEP 3/5") for k in sites prot_cut; do kv_del counts.tsv "$k"; done ;;
+    "STEP 4/5") kv_del counts.tsv prot_cut ;;
+  esac
+}
+# timings.tsv keeps the duration of every step across runs (a resumed run shows
+# the real total); counts.tsv caches the counts printed after each step so that
+# a resumed run does not decompress large files again.
+kv_get() { [[ -e "$1" ]] || return 0; awk -F'\t' -v k="$2" '$1 == k { v = $2 } END { if (v != "") print v }' "$1"; }
+kv_del() { [[ -e "$1" ]] || return 0; awk -F'\t' -v k="$2" '$1 != k' "$1" > "$1.new"; mv "$1.new" "$1"; }
+kv_set() { { [[ -e "$1" ]] && awk -F'\t' -v k="$2" '$1 != k' "$1"; printf '%s\t%s\n' "$2" "$3"; } > "$1.new"; mv "$1.new" "$1"; }
 step_end() {
   local d=$(( SECONDS - STEP_START ))
-  STEP_TIMES+=("$STEP_NAME|$(hms "$d")")
+  STEP_TIMES+=("$STEP_NAME|$d|run")
+  kv_set timings.tsv "$STEP_NAME" "$d"
   log "[$STEP_NAME] done in $(hms "$d")"
 }
-step_skip() { STEP_TIMES+=("$1|skipped (output present)"); echo; log "[$1] $2 -> $3 already present, step skipped"; }
+step_skip() {
+  STEP_TIMES+=("$1|$(kv_get timings.tsv "$1")|skipped")
+  echo; log "[$1] $2 -> $3 already present, step skipped"
+}
+# count NAME COMMAND...: cached value of NAME, or run COMMAND once and cache it
+count() {
+  local k=$1 v; shift
+  v=$(kv_get counts.tsv "$k")
+  if [[ -z "$v" ]]; then v=$("$@"); kv_set counts.tsv "$k" "$v"; fi
+  echo "$v"
+}
 trap 'log "ERROR: pipeline failed during $STEP_NAME (line $LINENO); re-run the same command to resume" >&2' ERR
 kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; kill "$1" 2>/dev/null || true; }
 trap 'log "INTERRUPTED during $STEP_NAME; re-run the same command to resume" >&2; trap - INT TERM ERR
@@ -95,61 +124,51 @@ echo "Threads       : $THREADS"
 echo "Output dir    : $PWD"
 echo "Index batch   : $MM2_BATCH"
 echo "Windows       : ${WINDOW}bp, overlap ${WINDOW_OVERLAP}bp, -N $MM2_N per window"
+echo "Max occ.      : ${MM2_MAX_OCC:-minimap2 default}"
 echo "======================================================================"
 
 # ------------------------------------------------------------------------------
-# STEP 1: PORE-C READ LENGTHS (FASTQ order = sort order used by bedtools)
+# STEP 1: PORE-C READ LENGTHS + OVERLAPPING WINDOWS (one pass over the FASTQ)
 # ------------------------------------------------------------------------------
-if done_already porec.genome; then
-  step_skip "STEP 1/6" "Pore-C read lengths" porec.genome
-else
-  step_begin "STEP 1/6" "Extracting Pore-C read lengths..."
-  (   # run in the background so that a stop signal is handled immediately
-  trap - ERR INT TERM
-  seqkit fx2tab -n -i -l -j "$THREADS" "$POREC_FQ" | cut -f1,2 > porec.genome.tmp
-  mv porec.genome.tmp porec.genome
-  ) & wait $!
-  step_end
-fi
-read -r N_POREC TOT_BP < <(awk '{n++; s += $2} END {print n + 0, s + 0}' porec.genome)
-log "  -> Pore-C reads input        : $N_POREC"
-log "  -> Total bases / mean length : $TOT_BP bp / $(awk -v t="$TOT_BP" -v n="$N_POREC" 'BEGIN {printf "%.1f", n ? t / n : 0}') bp"
-
-# ------------------------------------------------------------------------------
-# STEP 2: PORE-C READS SPLIT INTO OVERLAPPING WINDOWS
-# ------------------------------------------------------------------------------
+# porec.genome: read lengths in FASTQ order (= sort order used by bedtools).
 # minimap2 caps secondary hits (-N) per QUERY. With whole reads as queries, a
 # long Pore-C read (many monomers) shares one cap between all its monomers, and
 # most of them would get too few HiFi reads -> false cuts. Reads longer than
 # WINDOW are therefore split into windows of WINDOW bp overlapping by
 # WINDOW_OVERLAP bp (the last window is aligned on the read end); shorter reads
 # stay whole. Each window gets its own cap, so coverage no longer depends on
-# read length. Window name = <read>_W<offset>; step 3 adds the offset back and
+# read length. Window name = <read>_W<offset>; step 2 adds the offset back and
 # merges the blocks of a HiFi read across overlapping windows.
 WINDOWS=porec_windows.fa.gz
-if done_already "$WINDOWS"; then
-  step_skip "STEP 2/6" "Pore-C windows" "$WINDOWS"
+if done_already porec.genome "$WINDOWS"; then
+  step_skip "STEP 1/5" "Pore-C read lengths & windows" "porec.genome $WINDOWS"
 else
-  step_begin "STEP 2/6" "Splitting Pore-C reads into ${WINDOW}bp windows (overlap ${WINDOW_OVERLAP}bp)..."
+  step_begin "STEP 1/5" "Pore-C read lengths & ${WINDOW}bp windows (overlap ${WINDOW_OVERLAP}bp)..."
   (   # run in the background so that a stop signal is handled immediately
   trap - ERR INT TERM
   seqkit fx2tab -i -j "$THREADS" "$POREC_FQ" | \
-  awk -v W="$WINDOW" -v O="$WINDOW_OVERLAP" 'BEGIN { FS = "\t" }
+  awk -v W="$WINDOW" -v O="$WINDOW_OVERLAP" -v GEN=porec.genome.tmp -v CNT=windows.count.tmp 'BEGIN { FS = "\t" }
     {
-      L = length($2)
-      if (W <= 0 || L <= W) { print ">" $1 "_W0\n" $2; next }
-      for (s = 0; s + W < L; s += W - O) print ">" $1 "_W" s "\n" substr($2, s + 1, W)
-      print ">" $1 "_W" (L - W) "\n" substr($2, L - W + 1, W)
-    }' | $GZ > "$WINDOWS.tmp"
+      L = length($2); print $1 "\t" L > GEN
+      if (W <= 0 || L <= W) { print ">" $1 "_W0\n" $2; nw++; next }
+      for (s = 0; s + W < L; s += W - O) { print ">" $1 "_W" s "\n" substr($2, s + 1, W); nw++ }
+      print ">" $1 "_W" (L - W) "\n" substr($2, L - W + 1, W); nw++
+    }
+    END { print nw + 0 > CNT }' | $GZ > "$WINDOWS.tmp"
+  kv_set counts.tsv windows "$(cat windows.count.tmp)"; rm -f windows.count.tmp
+  mv porec.genome.tmp porec.genome
   mv "$WINDOWS.tmp" "$WINDOWS"
   ) & wait $!
   step_end
 fi
-N_WIN=$($GZ -dc "$WINDOWS" | grep -c '^>' || true)
+read -r N_POREC TOT_BP < <(count reads_bases awk '{n++; s += $2} END {print n + 0, s + 0}' porec.genome)
+log "  -> Pore-C reads input        : $N_POREC"
+log "  -> Total bases / mean length : $TOT_BP bp / $(awk -v t="$TOT_BP" -v n="$N_POREC" 'BEGIN {printf "%.1f", n ? t / n : 0}') bp"
+N_WIN=$(count windows bash -c "$GZ -dc '$WINDOWS' | grep -c '^>' || true")
 log "  -> Alignment queries (windows) : $N_WIN"
 
 # ------------------------------------------------------------------------------
-# STEP 3: PORE-C READS (query) ALIGNED ON HIFI READS (target) -> CONTINUOUS BLOCKS
+# STEP 2: PORE-C READS (query) ALIGNED ON HIFI READS (target) -> CONTINUOUS BLOCKS
 # ------------------------------------------------------------------------------
 # Each Pore-C monomer aligns on the HiFi reads of its locus; -N keeps the other
 # HiFi reads of the locus (secondary hits). -c gives the CIGAR: an alignment is
@@ -164,9 +183,9 @@ log "  -> Alignment queries (windows) : $N_WIN"
 #   porec_read  start  end  hifi_read
 BLOCKS=hifi_blocks.bed.gz
 if done_already "$BLOCKS"; then
-  step_skip "STEP 3/6" "Pore-C -> HiFi alignment" "$BLOCKS"
+  step_skip "STEP 2/5" "Pore-C -> HiFi alignment" "$BLOCKS"
 else
-  step_begin "STEP 3/6" "Aligning Pore-C reads on HiFi reads (minimap2 -c, $MM2_PRESET)..."
+  step_begin "STEP 2/5" "Aligning Pore-C reads on HiFi reads (minimap2 -c, $MM2_PRESET)..."
   (   # run in the background so that a stop signal is handled immediately
   trap - ERR INT TERM
   rm -rf mm2_tmp
@@ -190,8 +209,8 @@ else
     log "  -> single index batch: alignments streamed directly to $BLOCKS"
   fi
   minimap2 -c -x "$MM2_PRESET" -t "$THREADS" -I "$MM2_BATCH" ${SPLIT_OPT[@]+"${SPLIT_OPT[@]}"} \
-      --secondary=yes -N "$MM2_N" $MM2_EXTRA "$HIFI_FQ" "$WINDOWS" 2> minimap2.log | \
-  gawk -v G="$MAX_GAP" -v LONG="[0-9]{${#MAX_GAP},}[IDN]" '
+      --secondary=yes -N "$MM2_N" ${MM2_MAX_OCC:+-f "$MM2_MAX_OCC"} $MM2_EXTRA "$HIFI_FQ" "$WINDOWS" 2> minimap2.log | \
+  gawk -v G="$MAX_GAP" -v LONG="[0-9]{${#MAX_GAP},}[IDN]" -v CNT=aligned.count.tmp '
     BEGIN { OFS = "\t" }
     function add(q1, q2, t1, t2) {
       if (q2 <= q1) return
@@ -224,7 +243,7 @@ else
       for (i = 1; i <= m; i++) O[i] = MQ1[i]
       PROCINFO["sorted_in"] = "@val_num_asc"
       for (i in O) print cur, MQ1[i], MQ2[i], MT[i]
-      n = 0
+      n = 0; nreads++
     }
     {
       match($1, /_W[0-9]+$/)                           # window name -> read name + offset
@@ -246,23 +265,25 @@ else
       }
       add((st == "+") ? bq : qp, (st == "+") ? qp : bq, bt, tp)
     }
-    END { flush() }' | $GZ > "$BLOCKS.tmp"
+    END { flush(); print nreads + 0 > CNT }' | $GZ > "$BLOCKS.tmp"
+  log "  -> minimap2 repeat threshold: $(grep -m1 -o 'mid_occ = [0-9]*' minimap2.log || echo 'mid_occ = ?')"
+  kv_set counts.tsv aligned_reads "$(cat aligned.count.tmp)"; rm -f aligned.count.tmp
   mv "$BLOCKS.tmp" "$BLOCKS"
   rm -rf mm2_tmp
   ) & wait $!
   step_end
 fi
-N_ALN_READS=$($GZ -dc "$BLOCKS" | cut -f1 | uniq | wc -l)
+N_ALN_READS=$(count aligned_reads bash -c "$GZ -dc '$BLOCKS' | cut -f1 | uniq | wc -l")
 log "  -> Pore-C reads with HiFi alignments : $N_ALN_READS"
 
 # ------------------------------------------------------------------------------
-# STEP 4: RESTRICTION SITES (exact cut position)
+# STEP 3: RESTRICTION SITES (exact cut position)
 # ------------------------------------------------------------------------------
 # sites.tsv: read  length  motif_start  motif_end  x   (x = cut = motif_start + CUT_OFFSET)
 if done_already sites.tsv || done_already sites.final.tsv.gz; then
-  step_skip "STEP 4/6" "Restriction motifs" "$([[ -e sites.tsv ]] && echo sites.tsv || echo sites.final.tsv.gz)"
+  step_skip "STEP 3/5" "Restriction motifs" "$([[ -e sites.tsv ]] && echo sites.tsv || echo sites.final.tsv.gz)"
 else
-  step_begin "STEP 4/6" "Locating restriction motifs ($MOTIF)..."
+  step_begin "STEP 3/5" "Locating restriction motifs ($MOTIF)..."
   (   # run in the background so that a stop signal is handled immediately
   trap - ERR INT TERM
   seqkit locate -P -d -i -j "$THREADS" -p "$MOTIF" --bed "$POREC_FQ" | \
@@ -279,11 +300,11 @@ else
   ) & wait $!
   step_end
 fi
-N_MOTIFS=$(if [[ -e sites.final.tsv.gz ]]; then $GZ -dc sites.final.tsv.gz | wc -l; else wc -l < sites.tsv; fi)
+N_MOTIFS=$(count sites bash -c "if [[ -e sites.tsv ]]; then wc -l < sites.tsv; else $GZ -dc sites.final.tsv.gz | wc -l; fi")
 log "  -> Candidate motif sites     : $N_MOTIFS"
 
 # ------------------------------------------------------------------------------
-# STEP 5: SITE PROTECTION BY HIFI READS (bedtools map)
+# STEP 4: SITE PROTECTION BY HIFI READS (bedtools map)
 # ------------------------------------------------------------------------------
 #  span = number of DISTINCT HiFi reads with a continuous block covering
 #         [x-FLANK, x+FLANK] ENTIRELY (window truncated at read ends)
@@ -291,9 +312,9 @@ log "  -> Candidate motif sites     : $N_MOTIFS"
 #  C (cut)      : span <  MIN_COV -> cut, including when no HiFi read is present
 # sites.final.tsv.gz: read  length  motif_start  motif_end  x  span  class
 if done_already sites.final.tsv.gz; then
-  step_skip "STEP 5/6" "HiFi protection" sites.final.tsv.gz
+  step_skip "STEP 4/5" "HiFi protection" sites.final.tsv.gz
 else
-  step_begin "STEP 5/6" "Computing HiFi protection at each site (bedtools map)..."
+  step_begin "STEP 4/5" "Computing HiFi protection at each site (bedtools map)..."
   (   # run in the background so that a stop signal is handled immediately
   trap - ERR INT TERM
   paste sites.tsv \
@@ -309,25 +330,25 @@ else
   step_end
 fi
 
-read -r N_PROT N_CUT < <($GZ -dc sites.final.tsv.gz | awk '$7 == "P" { p++ } $7 == "C" { c++ } END { print p + 0, c + 0 }')
+read -r N_PROT N_CUT < <(count prot_cut bash -c "$GZ -dc sites.final.tsv.gz | awk '\$7 == \"P\" { p++ } \$7 == \"C\" { c++ } END { print p + 0, c + 0 }'")
 pct() { awk -v a="$1" -v b="$2" 'BEGIN { if (b > 0) printf "%.2f", 100 * a / b; else print 0 }'; }
 log "  -> Protected sites (>= $MIN_COV HiFi) : $N_PROT ($(pct "$N_PROT" "$N_MOTIFS")%)"
 log "  -> Cut sites (< $MIN_COV HiFi)        : $N_CUT ($(pct "$N_CUT" "$N_MOTIFS")%)"
 
 # ------------------------------------------------------------------------------
-# STEP 6: CUTTING + PSEUDO-MONOMER FILTER + ALL-TO-ALL PAIRS
+# STEP 5: CUTTING + PSEUDO-MONOMER FILTER + ALL-TO-ALL PAIRS
 # ------------------------------------------------------------------------------
 # Every unprotected site is cut. A motif lying within ~FLANK bp of a real
 # junction is not protected either: a pseudo-monomer of a few bp appears between
 # the two cuts. Monomers < MIN_MONO_LEN are dropped BEFORE pairing (they are not
 # mappable anyway). A read with n kept monomers gives n(n-1)/2 pairs
 # @read:i-j/1 and /2.
-OUT6=("${PREFIX}_R1.fastq.gz" "${PREFIX}_R2.fastq.gz" "${PREFIX}.stats")
-[[ "$WRITE_MONOMERS" == 1 ]] && OUT6+=("${PREFIX}_monomers.fastq.gz")
-if done_already "${OUT6[@]}"; then
-  step_skip "STEP 6/6" "Cutting & all-to-all pairs" "${OUT6[*]}"
+OUT5=("${PREFIX}_R1.fastq.gz" "${PREFIX}_R2.fastq.gz" "${PREFIX}.stats")
+[[ "$WRITE_MONOMERS" == 1 ]] && OUT5+=("${PREFIX}_monomers.fastq.gz")
+if done_already "${OUT5[@]}"; then
+  step_skip "STEP 5/5" "Cutting & all-to-all pairs" "${OUT5[*]}"
 else
-  step_begin "STEP 6/6" "Cutting reads & writing all-to-all pseudo-Hi-C pairs..."
+  step_begin "STEP 5/5" "Cutting reads & writing all-to-all pseudo-Hi-C pairs..."
   (   # run in the background so that a stop signal is handled immediately
   trap - ERR INT TERM
   seqkit fx2tab -i -j "$THREADS" "$POREC_FQ" | \
@@ -374,7 +395,7 @@ else
     }'
   read -r _ _ _ _ _ _ _ NCUTS_DONE < stats.tmp
   [[ $NCUTS_DONE -eq $N_CUT ]] || { log "ERROR: $NCUTS_DONE cuts applied, $N_CUT expected" >&2; exit 1; }
-  for f in "${OUT6[@]}"; do [[ "$f" == "${PREFIX}.stats" ]] || mv "$f.tmp" "$f"; done
+  for f in "${OUT5[@]}"; do [[ "$f" == "${PREFIX}.stats" ]] || mv "$f.tmp" "$f"; done
   mv stats.tmp "${PREFIX}.stats"                      # written last: marks the step as complete
   ) & wait $!
   step_end
@@ -393,8 +414,15 @@ log "  -> Per-site table                : $PWD/sites.final.tsv.gz"
 log "     (read len motif_start motif_end cut span class)"
 echo
 log "Execution times:"
-for t in "${STEP_TIMES[@]}"; do log "  ${t%%|*} : ${t#*|}"; done
-log "  TOTAL    : $(hms $(( SECONDS - PIPELINE_START )))"
+TOTAL_ALL=0; MISSING_T=0
+for t in "${STEP_TIMES[@]}"; do
+  IFS='|' read -r name d how <<< "$t"
+  if [[ -z "$d" ]]; then log "  $name : skipped (duration not recorded)"; MISSING_T=1; continue; fi
+  TOTAL_ALL=$(( TOTAL_ALL + d ))
+  if [[ $how == run ]]; then log "  $name : $(hms "$d")"; else log "  $name : $(hms "$d") (previous run, skipped now)"; fi
+done
+log "  TOTAL (all steps) : $(hms "$TOTAL_ALL")$([[ $MISSING_T == 1 ]] && echo ' + steps without recorded duration')"
+log "  TOTAL (this run)  : $(hms $(( SECONDS - PIPELINE_START )))"
 echo "======================================================================"
 echo "        ALL PIPELINE STEPS COMPLETED - $(date '+%Y-%m-%d %H:%M:%S')"
 echo "======================================================================"

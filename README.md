@@ -21,12 +21,11 @@ No Python.
 
 | step | tools | output |
 |---|---|---|
-| 1. read lengths | `seqkit fx2tab -n -l` | `porec.genome` (FASTQ order) |
-| 2. overlapping windows for long reads | `seqkit fx2tab` + `awk` | `porec_windows.fa.gz` |
-| 3. Pore-C → HiFi alignment | `minimap2 -c -N` + `gawk` | `hifi_blocks.bed.gz`: continuous blocks of each HiFi read, in Pore-C coordinates |
-| 4. restriction sites | `seqkit locate` + `awk` | exact cut position `x = motif start + CUT_OFFSET` |
-| 5. HiFi protection | `bedtools map -f 1.0 -o count_distinct` | `sites.final.tsv.gz` (`span`, class P/C) |
-| 6. cutting, pseudo-monomer filter, all-to-all pairs | `seqkit fx2tab` + `awk` | R1/R2, monomers |
+| 1. read lengths + overlapping windows for long reads (one pass) | `seqkit fx2tab` + `awk` | `porec.genome` (FASTQ order), `porec_windows.fa.gz` |
+| 2. Pore-C → HiFi alignment | `minimap2 -c -N` + `gawk` | `hifi_blocks.bed.gz`: continuous blocks of each HiFi read, in Pore-C coordinates |
+| 3. restriction sites | `seqkit locate` + `awk` | exact cut position `x = motif start + CUT_OFFSET` |
+| 4. HiFi protection | `bedtools map -f 1.0 -o count_distinct` | `sites.final.tsv.gz` (`span`, class P/C) |
+| 5. cutting, pseudo-monomer filter, all-to-all pairs | `seqkit fx2tab` + `awk` | R1/R2, monomers |
 
 - **No global sort:** all files stay in Pore-C FASTQ order, and
   `bedtools map -g porec.genome` works in that order.
@@ -37,16 +36,19 @@ No Python.
 
   | step | output checked |
   |---|---|
-  | 1 | `porec.genome` |
-  | 2 | `porec_windows.fa.gz` |
-  | 3 | `hifi_blocks.bed.gz` |
-  | 4 | `sites.tsv` (or `sites.final.tsv.gz`) |
-  | 5 | `sites.final.tsv.gz` |
-  | 6 | `porec_hic_R1.fastq.gz`, `porec_hic_R2.fastq.gz`, `porec_hic.stats` (and `porec_hic_monomers.fastq.gz`) |
+  | 1 | `porec.genome` and `porec_windows.fa.gz` |
+  | 2 | `hifi_blocks.bed.gz` |
+  | 3 | `sites.tsv` (or `sites.final.tsv.gz`) |
+  | 4 | `sites.final.tsv.gz` |
+  | 5 | `porec_hic_R1.fastq.gz`, `porec_hic_R2.fastq.gz`, `porec_hic.stats` (and `porec_hic_monomers.fastq.gz`) |
 
-- **Log:** every message is timestamped. The log gives the duration of each step and
-  the total time at the end. The total covers the current run only: skipped steps
-  count for 0.
+- **Log:** every message is timestamped, and each step reports its duration.
+  - **Durations across runs.** `timings.tsv` keeps the duration of every step across
+    runs. The final summary shows, for skipped steps, their duration from the previous
+    run, then two totals: all steps (real compute time) and this run only.
+  - **Cached counts.** The counts printed after each step are cached in `counts.tsv`, so
+    a resumed run does not decompress large files again to recount them. The cache of a
+    step is cleared when that step runs again.
 - **Stop:** on `kill` or Ctrl-C, the running step and its child processes (minimap2…)
   are stopped at once, and the log says which step to resume.
 
@@ -209,13 +211,26 @@ bp appears between the two cuts. Monomer lengths on the simulation:
 | `MM2_PRESET` | `map-ont` | `lr:hq` for ONT R10 Q20+ reads |
 | `MM2_N` | 200 | minimap2 secondary hits, capped **per window**; aim for ≥ 5 × HiFi depth |
 | `WINDOW` / `WINDOW_OVERLAP` | 2000 / 250 | reads longer than `WINDOW` are aligned as overlapping windows (`WINDOW=0`: whole reads) |
-| `MM2_BATCH` | 50G | HiFi index batch size (`-I` with `--split-prefix`) |
+| `MM2_BATCH` | 50G | HiFi index batch size (`-I`) |
+| `MM2_SPLIT` | auto | `--split-prefix` only if the HiFi reads need several index batches (it stores all alignments on disk until the end) |
+| `MM2_MAX_OCC` | – (minimap2 default) | ignore HiFi minimizers seen more than this many times (`minimap2 -f INT`), see *Cost* |
 | `MM2_EXTRA` | – | extra minimap2 options |
 
 ## Cost
 
-- **Volume.** Step 3 produces about (number of Pore-C monomers) × (HiFi depth)
+- **Volume.** Step 2 produces about (number of Pore-C monomers) × (HiFi depth)
   alignments, with CIGAR.
+- **Repeat threshold (`MM2_MAX_OCC`).** minimap2 ignores minimizers more frequent than a
+  threshold, by default the 0.02% most frequent.
+  - **Why it gets very high.** HiFi reads are a redundant "reference" (every locus is
+    present depth × copies times), so this threshold gets very high. The log prints it
+    (`mid_occ = ...`). In a pentaploid with 18x HiFi per copy it was 11,530, and step 2
+    took 112 h: chaining spends most of its time in seeds from repeats.
+  - **Setting it.** `MM2_MAX_OCC=1000` caps the threshold. Keep it well above
+    HiFi depth × number of copies (about 90 there).
+  - **Too low hurts.** On simulated data (20x HiFi), a threshold of 25 dropped
+    precision from 0.92 to 0.85, because seeds of single-copy sequence get discarded.
+    1000 gave the same result as the default.
 - **HiFi depth.** Time and the size of `hifi_blocks.bed.gz` scale with HiFi depth (up to
   `MM2_N` hits per window).
 - **Windows.** They add about 14% of aligned bases for reads longer than 2 kb.
