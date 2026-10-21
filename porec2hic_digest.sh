@@ -19,10 +19,45 @@
 set -Eeuo pipefail
 export LC_ALL=C
 
+usage() {
+  cat <<'EOF'
+Usage: POREC_FQ=porec.fq.gz [VAR=value ...] porec2hic_digest.sh [-h|--help]
+
+Cuts Pore-C reads at every restriction site and writes pseudo-Hi-C pairs
+(R1/R2) in one streaming pass. Parameters are environment variables:
+
+  POREC_FQ        Pore-C reads, FASTQ or FASTQ.gz                       (required)
+  OUTDIR          output directory                                      [porec2hic_digest_out]
+  PREFIX          output file prefix                                    [porec_hic]
+  MOTIF           palindromic motif, IUPAC codes allowed                [CATG]
+  CUT_OFFSET      cut position inside the motif (CATG^ = 4, ^GATC = 0)  [4]
+  DUP_MOTIF       1 = keep the motif on both monomers                   [0]
+  MIN_MONO_LEN    shorter monomers are dropped before pairing (bp)      [30]
+  PAIR_MODE       all = all-to-all, n(n-1)/2 pairs; seq = adjacent only [all]
+  WRITE_MONOMERS  1 = also write PREFIX_monomers.fastq.gz               [0]
+  THREADS         total CPU threads                                     [96]
+  WORKERS         parallel mawk workers                                 [THREADS / 4]
+  GZ_THREADS      pigz threads per output stream of each worker         [2]
+  GZ_LEVEL        gzip compression level                                [1]
+  KEEP_CHUNKS     1 = keep per-worker chunks instead of concatenating   [0]
+
+Outputs: OUTDIR/PREFIX_R1.fastq.gz, PREFIX_R2.fastq.gz, PREFIX.stats
+Pair names: @read:i-j/1 and /2 (i, j = monomer ranks in the read).
+
+Example:
+  nohup env POREC_FQ=porec.fq.gz THREADS=96 bash porec2hic_digest.sh > digest.log 2>&1 &
+EOF
+}
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  "") ;;
+  *) echo "ERROR: unknown argument '$1' (parameters are environment variables)" >&2; usage >&2; exit 1 ;;
+esac
+[[ -n "${POREC_FQ:-}" ]] || { echo "ERROR: POREC_FQ is not set" >&2; usage >&2; exit 1; }
+
 # ------------------------------------------------------------------------------
 # PARAMETERS
 # ------------------------------------------------------------------------------
-POREC_FQ=${POREC_FQ:?"POREC_FQ is not set"}
 OUTDIR=${OUTDIR:-porec2hic_digest_out}
 PREFIX=${PREFIX:-porec_hic}
 
