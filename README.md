@@ -41,9 +41,9 @@ not split reads, so it cannot replace this step.
 
 ```bash
 POREC_FQ=porec.fq.gz HIFI_FQ=hifi.fq.gz THREADS=96 ./porec2hic_hifi.sh
-./porec2hic_hifi.sh --help                                   # all parameters
 # -> porec2hic_out/porec_hic_R1.fastq.gz, porec_hic_R2.fastq.gz,
 #    porec_hic_monomers.fastq.gz, sites.final.tsv.gz
+./porec2hic_hifi.sh --help                                   # all parameters
 ```
 
 A CATG motif in a Pore-C read is either a ligation junction or a genomic motif.
