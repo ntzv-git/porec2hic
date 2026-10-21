@@ -17,6 +17,54 @@ nohup env POREC_FQ=porec.fq.gz HIFI_FQ=hifi.fq.gz MM2_BATCH=200G THREADS=96 \
 Requirements: `minimap2`, `seqkit`, `bedtools` (≥ 2.26), `gawk`, and optionally `pigz`.
 No Python.
 
+## Fast plain digestion (no HiFi): `porec2hic_digest.sh`
+
+When every restriction site should be cut (same result as `pore-c-py digest`), this
+script goes from the Pore-C FASTQ to the R1/R2 pairs in **one streaming pass**, with no
+intermediate BAM:
+
+```bash
+POREC_FQ=porec.fq.gz THREADS=96 ./porec2hic_digest.sh          # NlaIII, all-to-all, monomers >= 30 bp
+# -> porec2hic_digest_out/porec_hic_R1.fastq.gz, porec_hic_R2.fastq.gz, porec_hic.stats
+nohup env POREC_FQ=porec.fq.gz THREADS=96 bash ./porec2hic_digest.sh > digest.log 2>&1 &
+```
+
+Requirements: coreutils, `mawk` (or `gawk`), `pigz` (or `gzip`); `rapidgzip` or `igzip`
+are used for decompression when installed.
+
+- **Pipeline.** `decompress | paste - - - - | split -n r/WORKERS --filter=mawk`: reads are
+  dealt round robin to `WORKERS` mawk processes (default `THREADS / 4`). Each worker cuts
+  every motif, drops monomers shorter than `MIN_MONO_LEN`, writes its pairs to its own
+  gzip chunks, each compressed by its own `pigz`. The chunks are then concatenated in the
+  same order for R1 and R2 (a concatenation of gzip files is a valid gzip file).
+- **Why it is faster.** `pore-c-py digest` processes reads in Python and writes a BAM,
+  which a second pass then decodes again to build the pairs. Here the cut is a `split()`
+  on the motif (linear in read length) and every stage runs in parallel. A worker
+  digests 60–90 MB/s of uncompressed FASTQ, so decompression of the input and
+  compression of the output are the limiting steps.
+- **Cut.** Same as `pore-c-py digest`: NlaIII `CATG^` (`CUT_OFFSET=4`), the motif stays at
+  the end of the left monomer. `DUP_MOTIF=1` keeps it on both monomers instead.
+- **Names.** Same as `porec2hic_hifi.sh`: `@read:i-j/1` and `/2`; monomers
+  (`WRITE_MONOMERS=1`) are `@read_start_end`.
+- **Output volume.** All-to-all gives n(n-1)/2 pairs per read: a few highly fragmented
+  reads can dominate the output (see *Weight of highly fragmented reads*). `PAIR_MODE=seq`
+  writes only adjacent monomers (n-1 pairs).
+- **No concatenation.** `KEEP_CHUNKS=1` keeps the `WORKERS` chunks per side and prints
+  them as comma-separated lists, which `hifiasm --h1/--h2` accept directly.
+- **HiC-Pro `digest_genome.py`** digests a reference **genome** FASTA into a BED of
+  restriction fragments. It does not split reads, so it cannot replace this step.
+
+| variable | default | role |
+|---|---|---|
+| `MOTIF` / `CUT_OFFSET` | `CATG` / 4 | enzyme (palindromic motif, IUPAC codes allowed) |
+| `DUP_MOTIF` | 0 | 1 = keep the motif on both monomers |
+| `MIN_MONO_LEN` | 30 | shorter monomers are dropped before pairing |
+| `PAIR_MODE` | `all` | `all` = all-to-all, `seq` = adjacent monomers only |
+| `THREADS` / `WORKERS` | 96 / `THREADS / 4` | mawk workers; each also runs 2 `pigz` |
+| `GZ_THREADS` / `GZ_LEVEL` | 2 / 1 | `pigz` threads per output stream of a worker, compression level |
+| `WRITE_MONOMERS` | 0 | 1 = also write `porec_hic_monomers.fastq.gz` |
+| `KEEP_CHUNKS` | 0 | 1 = keep per-worker chunks instead of concatenating them |
+
 ## Steps
 
 | step | tools | output |
