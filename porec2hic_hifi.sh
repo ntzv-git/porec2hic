@@ -15,11 +15,55 @@
 set -Eeuo pipefail
 export LC_ALL=C
 
+usage() {
+  cat <<'EOF'
+Usage: POREC_FQ=porec.fq.gz HIFI_FQ=hifi.fq.gz [VAR=value ...] porec2hic_hifi.sh [-h|--help]
+
+Cuts Pore-C reads only at restriction sites that HiFi reads do not read through,
+then writes all-to-all pseudo-Hi-C pairs (R1/R2). Parameters are environment
+variables. A re-run resumes at the first step whose output is missing.
+
+  POREC_FQ        Pore-C reads, FASTQ or FASTQ.gz                        (required)
+  HIFI_FQ         HiFi reads, FASTQ/FASTA(.gz) or minimap2 .mmi index    (required)
+  OUTDIR          output directory                                       [porec2hic_out]
+  PREFIX          output file prefix                                     [porec_hic]
+  MOTIF           palindromic motif, IUPAC codes allowed                 [CATG]
+  CUT_OFFSET      cut position inside the motif (CATG^ = 4, ^GATC = 0)   [4]
+  DUP_MOTIF       1 = keep the motif on both monomers                    [1]
+  MIN_COV         continuous HiFi reads needed to protect a site         [3]
+  FLANK           continuity margin on each side of the site (bp)        [15]
+  MAX_GAP         indel (bp) that breaks HiFi continuity                 [50]
+  MIN_MONO_LEN    shorter monomers are dropped before pairing (bp)       [FLANK + motif + 1]
+  WRITE_MONOMERS  1 = also write PREFIX_monomers.fastq.gz                [1]
+  THREADS         CPU threads                                            [96]
+  MM2_PRESET      minimap2 preset (lr:hq for ONT R10 Q20+)               [map-ont]
+  MM2_N           minimap2 secondary hits per window (>= 5 x HiFi depth) [200]
+  WINDOW          reads longer than this are aligned as windows (0 = off) [2000]
+  WINDOW_OVERLAP  overlap between consecutive windows (bp)               [250]
+  MM2_BATCH       HiFi index batch size (minimap2 -I)                    [50G]
+  MM2_SPLIT       --split-prefix: auto = only if several index batches   [auto]
+  MM2_MAX_OCC     ignore minimizers seen more often (minimap2 -f), e.g. 1000 [minimap2 default]
+  MM2_EXTRA       extra minimap2 options                                 []
+
+Outputs: OUTDIR/PREFIX_R1.fastq.gz, PREFIX_R2.fastq.gz, PREFIX.stats,
+         PREFIX_monomers.fastq.gz, sites.final.tsv.gz
+Pair names: @read:i-j/1 and /2 (i, j = monomer ranks in the read).
+
+Example:
+  nohup env POREC_FQ=porec.fq.gz HIFI_FQ=hifi.fq.gz THREADS=96 bash porec2hic_hifi.sh > porec2hic.log 2>&1 &
+EOF
+}
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  "") ;;
+  *) echo "ERROR: unknown argument '$1' (parameters are environment variables)" >&2; usage >&2; exit 1 ;;
+esac
+[[ -n "${POREC_FQ:-}" ]] || { echo "ERROR: POREC_FQ is not set" >&2; usage >&2; exit 1; }
+[[ -n "${HIFI_FQ:-}" ]] || { echo "ERROR: HIFI_FQ is not set (HiFi FASTQ/FASTA or .mmi index)" >&2; usage >&2; exit 1; }
+
 # ------------------------------------------------------------------------------
 # PIPELINE PARAMETERS
 # ------------------------------------------------------------------------------
-POREC_FQ=${POREC_FQ:?"POREC_FQ is not set"}
-HIFI_FQ=${HIFI_FQ:?"HIFI_FQ is not set (HiFi FASTQ/FASTA or .mmi index)"}
 OUTDIR=${OUTDIR:-porec2hic_out}
 PREFIX=${PREFIX:-porec_hic}
 
