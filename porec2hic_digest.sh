@@ -119,7 +119,7 @@ echo "Pore-C File   : $POREC_FQ"
 echo "Motif         : $MOTIF (regex $MOTIF_RE, cut offset $CUT_OFFSET, motif on both monomers: $DUP_MOTIF)"
 echo "Min monomer   : $MIN_MONO_LEN bp"
 echo "Pairing mode  : $PAIR_MODE"
-echo "Workers       : $WORKERS x ($AWK + 2 x ${GZ%% *} -p $GZ_THREADS), decompression: $UNZIP"
+echo "Workers       : $WORKERS x ($AWK + 2 x $GZ), decompression: $UNZIP"
 echo "Output Dir    : $PWD"
 echo "======================================================================"
 
