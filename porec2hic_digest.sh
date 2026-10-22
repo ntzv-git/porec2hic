@@ -200,7 +200,16 @@ else
   done
   rm -rf "$CHUNKS"
 fi
-echo "$READS $SITES $MONO $SHORT $KEPT $MULTI $SINGLE $PAIRS" > "${PREFIX}.stats"
+{ printf 'metric\tvalue\n'
+  printf 'reads\t%s\n' "$READS"
+  printf 'sites_cut\t%s\n' "$SITES"
+  printf 'monomers_generated\t%s\n' "$MONO"
+  printf 'monomers_short_removed\t%s\n' "$SHORT"
+  printf 'monomers_kept\t%s\n' "$KEPT"
+  printf 'reads_multi_monomer\t%s\n' "$MULTI"
+  printf 'reads_lt2_monomers\t%s\n' "$SINGLE"
+  printf 'pairs\t%s\n' "$PAIRS"
+} > "${PREFIX}.stats"
 
 log "  -> Reads                         : $READS"
 log "  -> Restriction sites cut         : $SITES"
