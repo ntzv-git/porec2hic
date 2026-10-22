@@ -38,7 +38,7 @@ Cuts Pore-C reads at every restriction site and writes pseudo-Hi-C pairs
   THREADS         total CPU threads                                     [96]
   WORKERS         parallel mawk workers                                 [THREADS / 4]
   GZ_THREADS      pigz threads per output stream of each worker         [2]
-  GZ_LEVEL        gzip compression level                                [1]
+  GZ_LEVEL        gzip compression level (1 = fastest, 9 = smallest)    [6]
   KEEP_CHUNKS     1 = keep per-worker chunks instead of concatenating   [0]
 
 Outputs: OUTDIR/PREFIX_R1.fastq.gz, PREFIX_R2.fastq.gz, PREFIX.stats
@@ -72,7 +72,7 @@ WRITE_MONOMERS=${WRITE_MONOMERS:-0}     # 1 = also write the FASTQ of kept monom
 THREADS=${THREADS:-96}
 WORKERS=${WORKERS:-$(( THREADS / 4 > 0 ? THREADS / 4 : 1 ))}  # mawk processes; each has its own compressors
 GZ_THREADS=${GZ_THREADS:-2}       # pigz threads per output stream of each worker
-GZ_LEVEL=${GZ_LEVEL:-1}           # 1 = fastest; output size barely changes up to 6
+GZ_LEVEL=${GZ_LEVEL:-6}           # 6 = pigz default; 1 is faster but gives ~30% larger files
 KEEP_CHUNKS=${KEEP_CHUNKS:-0}     # 1 = do not concatenate: keep W chunks per side
                                   # (hifiasm takes them as a comma-separated list)
 

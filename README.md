@@ -52,6 +52,8 @@ nohup env POREC_FQ=porec.fq.gz THREADS=96 bash ./porec2hic_digest.sh > digest.lo
   which `hifiasm --h1/--h2` accept.
 - **Speed.** A worker digests 60–90 MB/s of FASTQ. Decompressing the input (`rapidgzip`
   or `igzip` are used when installed) and compressing the output are the limiting steps.
+  Output is compressed at `GZ_LEVEL=6` (pigz default). `GZ_LEVEL=1` is faster but
+  gives about 30% larger files.
 - **Cut.** NlaIII `CATG^` (`CUT_OFFSET=4`) leaves the motif at the end of the left
   monomer. `DUP_MOTIF=1` keeps it on both monomers.
 - **`PAIR_MODE=seq`.** Writes only adjacent monomers (n-1 pairs instead of n(n-1)/2).
