@@ -9,7 +9,7 @@ hifiasm or YAHS.
 | `porec2hic_digest.sh` | **every** motif | one streaming pass | `mawk`, `pigz` |
 | `porec2hic_hifi.sh` | motifs **not** read through by HiFi reads (genomic motifs are kept) | aligns Pore-C on HiFi: hours to days | `minimap2`, `seqkit`, `bedtools` ≥ 2.26, `gawk`, `pigz` |
 
-The two digestion tools write `PREFIX_R1.fastq.gz`, `PREFIX_R2.fastq.gz` and `PREFIX.stats`, name pairs
+Both tools write `PREFIX_R1.fastq.gz`, `PREFIX_R2.fastq.gz` and `PREFIX.stats`, name pairs
 `@read:i-j/1` and `/2` (i, j = monomer ranks in the read), and take their parameters as
 environment variables (`--help` lists them). Their default output directories differ
 (`porec2hic_digest_out`, `porec2hic_out`), so both can run from the same directory.
@@ -58,8 +58,6 @@ nohup env POREC_FQ=porec.fq.gz THREADS=96 bash ./porec2hic_digest.sh > digest.lo
   monomer. `DUP_MOTIF=1` keeps it on both monomers.
 - **`PAIR_MODE=seq`.** Writes only adjacent monomers (n-1 pairs instead of n(n-1)/2).
   In all-to-all mode, a few highly fragmented reads can dominate the output.
-- **`PAIR_MODE=none`.** Writes only the monomers (`PREFIX_monomers.fastq.gz`, named
-  `@read_start_end`), for example to align each monomer once.
 
 ## `porec2hic_hifi.sh`: cut only the sites HiFi reads do not read through
 
@@ -142,44 +140,3 @@ too low a value discards seeds from single-copy sequence.
 (`span`, column 6). Expect a peak at 0 (junctions) and a peak near the HiFi depth
 (genomic sites). Many sites at 1 or 2 are mostly genomic sites cut by mistake: add HiFi
 data, raise `MM2_N`, or lower `MIN_COV`.
-
-## `porec_hap_rebalance.sh`: put misassigned contigs back in their haplotype
-
-```bash
-env POREC_FQ=porec.fq.gz PAIR_MODE=none OUTDIR=monomers bash ./porec2hic_digest.sh
-HAPS="hap1.fa hap2.fa hap3.fa hap4.fa hap5.fa" MONOMERS=monomers/porec_hic_monomers.fastq.gz \
-    ORG_FA=organelles.fa THREADS=96 ./porec_hap_rebalance.sh
-```
-
-A phased assembler can put contigs of one haplotype into another one. The receiving
-haplotype then carries duplicated genes, and the other one misses them. Purging the
-duplicates at this stage would delete the missing haplotype's sequence. This tool moves
-such contigs back, using Pore-C contacts. Needs `minimap2` and `compleasm`.
-
-| step | what | output |
-|---|---|---|
-| 1 | contigs renamed `hapN_…`; organelle filter (`MIN_ORG_ALN`, `MIN_ORG_COV`, `MIN_ORG_ID`, `MAX_ORG_LEN`) | `1_organelles/organelle_contigs.tsv` |
-| 2 | check: size, compleasm S/D/F/M, and genes missing in haplotype A but duplicated in B, against chance | `2_check_before/` |
-| 3 | monomers aligned once on all haplotypes, best hit with MAPQ ≥ `MIN_MAPQ` | `3_contacts/monomer_hits.tsv.gz` |
-| 4 | Pore-C reads linking each pair of contigs; moves | `4_moves/moves.tsv`, `contig_links.tsv` |
-| 5 | check again | `5_check_after/`, `final/hapN.fa` |
-
-- **Verdicts.** Each check ends with a verdict and the next step, gathered in
-  `DECISIONS.txt`:
-  - `MISASSIGNED`: haplotype A misses genes that B duplicates, more often than by
-    chance (`ENRICH`, `MIN_OBS`). Contigs are moved, and nothing is purged before that.
-  - `REDUNDANT`: one haplotype has `D_EXCESS` points more duplicated genes than the
-    lowest one, without misassignment. Run purge_dups on that haplotype only.
-  - `BALANCED`: go to scaffolding.
-- **Stop.** If the first verdict is not `MISASSIGNED`, steps 3–5 are skipped
-  (`FORCE_REBALANCE=1` runs them anyway).
-- **Moves.** Only from B to A for a flagged pair. A contig moves when it is at least
-  `MIN_CTG_LEN` long, and its links to A are at least `MIN_LINKS` reads, `MIN_RATIO` times
-  its links to B, and `MIN_SHARE` of all its links.
-  - **Round 1.** Only contigs carrying the flagged genes are candidates. Their links are
-    counted with the other contigs only, because misplaced contigs of a region are often
-    misplaced together.
-  - **Later rounds** (up to `MAX_ROUNDS`). Every other contig of B, with the corrected
-    assignment, which catches misplaced contigs without compleasm genes.
-- **Resume.** A step whose output exists is skipped. Delete it to redo the step.
-

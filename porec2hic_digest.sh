@@ -33,8 +33,7 @@ Cuts Pore-C reads at every restriction site and writes pseudo-Hi-C pairs
   CUT_OFFSET      cut position inside the motif (CATG^ = 4, ^GATC = 0)  [4]
   DUP_MOTIF       1 = keep the motif on both monomers                   [0]
   MIN_MONO_LEN    shorter monomers are dropped before pairing (bp)      [30]
-  PAIR_MODE       all = all-to-all, n(n-1)/2 pairs; seq = adjacent only;  [all]
-                  none = no pairs, monomers only (sets WRITE_MONOMERS=1)
+  PAIR_MODE       all = all-to-all, n(n-1)/2 pairs; seq = adjacent only [all]
   WRITE_MONOMERS  1 = also write PREFIX_monomers.fastq.gz               [0]
   THREADS         total CPU threads                                     [96]
   WORKERS         parallel mawk workers                                 [THREADS / 4]
@@ -68,7 +67,6 @@ DUP_MOTIF=${DUP_MOTIF:-0}         # 1 = keep the motif (rebuilt by ligation) on 
                                   # 0 = plain cut at CUT_OFFSET, as pore-c-py digest does
 MIN_MONO_LEN=${MIN_MONO_LEN:-30}  # monomers shorter than this are dropped before pairing
 PAIR_MODE=${PAIR_MODE:-all}       # all = all-to-all, n(n-1)/2 pairs ; seq = adjacent monomers only, n-1 pairs
-                                  # none = monomers only (e.g. to align each monomer once)
 WRITE_MONOMERS=${WRITE_MONOMERS:-0}     # 1 = also write the FASTQ of kept monomers
 
 THREADS=${THREADS:-96}
@@ -94,8 +92,7 @@ if [[ "${RC^^}" != "${MOTIF^^}" ]]; then
   echo "ERROR: motif $MOTIF is not palindromic (revcomp $RC): not supported" >&2; exit 1
 fi
 MOTIF=${MOTIF^^}
-[[ "$PAIR_MODE" == all || "$PAIR_MODE" == seq || "$PAIR_MODE" == none ]] || { echo "ERROR: PAIR_MODE must be 'all', 'seq' or 'none'" >&2; exit 1; }
-[[ "$PAIR_MODE" == none ]] && WRITE_MONOMERS=1
+[[ "$PAIR_MODE" == all || "$PAIR_MODE" == seq ]] || { echo "ERROR: PAIR_MODE must be 'all' or 'seq'" >&2; exit 1; }
 (( CUT_OFFSET >= 0 && CUT_OFFSET <= ${#MOTIF} )) || { echo "ERROR: CUT_OFFSET must be in [0, ${#MOTIF}]" >&2; exit 1; }
 # IUPAC motif -> regex (a plain ACGT motif stays a plain string)
 MOTIF_RE=$(echo "$MOTIF" | sed -e 's/R/[AG]/g; s/Y/[CT]/g; s/K/[GT]/g; s/M/[AC]/g; s/S/[CG]/g; s/W/[AT]/g' \
@@ -156,7 +153,6 @@ BEGIN { FS = "\t"; ml = length(motif) }
   reads++; kept += n
   if (n < 2) { single++; next }
   multi++
-  if (nopair) next
   for (i = 1; i < n; i++)
     for (j = i + 1; j <= (all ? n : i + 1); j++) {
       tag = "@" id ":" i "-" j
@@ -173,7 +169,7 @@ AWK
 
 # split runs the filter once per chunk with $FILE = chunks/NNN
 FILTER="$AWK -v re='$MOTIF_RE' -v motif='$MOTIF' -v off=$CUT_OFFSET -v dup=$DUP_MOTIF \
-  -v minlen=$MIN_MONO_LEN -v all=$([[ $PAIR_MODE == all ]] && echo 1 || echo 0) -v nopair=$([[ $PAIR_MODE == none ]] && echo 1 || echo 0) -v wm=$WRITE_MONOMERS \
+  -v minlen=$MIN_MONO_LEN -v all=$([[ $PAIR_MODE == all ]] && echo 1 || echo 0) -v wm=$WRITE_MONOMERS \
   -v c1=\"$GZ > \$FILE.R1.fastq.gz\" -v c2=\"$GZ > \$FILE.R2.fastq.gz\" -v cm=\"$GZ > \$FILE.monomers.fastq.gz\" \
   -v stats=\"\$FILE.stats\" -f worker.awk"
 
@@ -191,7 +187,7 @@ log "Digestion done in $(hms $(( SECONDS - START )))"
 # ------------------------------------------------------------------------------
 # OUTPUTS: same chunk order for R1 and R2 -> pairs stay in sync
 # ------------------------------------------------------------------------------
-SIDES=(); [[ "$PAIR_MODE" != none ]] && SIDES=(R1 R2); [[ "$WRITE_MONOMERS" == 1 ]] && SIDES+=(monomers)
+SIDES=(R1 R2); [[ "$WRITE_MONOMERS" == 1 ]] && SIDES+=(monomers)
 if [[ "$KEEP_CHUNKS" == 1 ]]; then
   for s in "${SIDES[@]}"; do
     log "  -> $s chunks: $(ls "$PWD/$CHUNKS"/*."$s".fastq.gz | paste -sd,)"
@@ -224,9 +220,8 @@ log "  -> Multi-monomer reads           : $MULTI"
 log "  -> Reads with < 2 monomers       : $SINGLE (no pair possible)"
 log "  -> Pseudo-Hi-C pairs ($PAIR_MODE)       : $PAIRS"
 if [[ "$KEEP_CHUNKS" != 1 ]]; then
-  for s in "${SIDES[@]}"; do
-    log "  -> Output file                   : $PWD/${PREFIX}_${s}.fastq.gz ($(du -h "${PREFIX}_${s}.fastq.gz" | cut -f1))"
-  done
+  log "  -> Output files                  : $PWD/${PREFIX}_R1.fastq.gz ($(du -h "${PREFIX}_R1.fastq.gz" | cut -f1))"
+  log "                                     $PWD/${PREFIX}_R2.fastq.gz ($(du -h "${PREFIX}_R2.fastq.gz" | cut -f1))"
 fi
 log "  TOTAL : $(hms $(( SECONDS - START )))"
 echo "======================================================================"
